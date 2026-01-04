@@ -1,0 +1,23 @@
+.{
+    .name = .crucible,
+    .version = "0.0.0",
+    .fingerprint = 0x3c213e674b29b73a,
+    .minimum_zig_version = "0.15.2",
+
+    .dependencies = .{
+        .libxev = .{
+            .url = "git+https://github.com/mitchellh/libxev#42d4ead52667e03619dcd5b1a3ca8ef7d5dd24ed",
+            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
+        },
+        .lz4 = .{
+            .url = "git+https://github.com/jedisct1/zig-lz4#4c125c4309ec24339a1f6f2f06028bb855e0a86a",
+            .hash = "lz4-0.1.0-fUqx0WZqAwCazL3_Ua1gl5SekV6qWUAQmEwhTyE9fr9X",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,0 +1,1840 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const xev = @import("xev").Dynamic;
+const cache = @import("../cache/mod.zig");
+const buffer = @import("buffer.zig");
+const connection = @import("connection.zig");
+const execute = @import("execute.zig");
+const persistence = @import("persistence.zig");
+const resource_controls = @import("resource_controls.zig");
+const stats = @import("stats.zig");
+const http = @import("protocol/http.zig");
+const resp = @import("protocol/resp.zig");
+const comptime_parser = @import("protocol/comptime_parser.zig");
+
+pub const Protocol = enum {
+    auto,
+    http,
+    resp,
+};
+
+pub const Limits = comptime_parser.Limits;
+
+pub const ServerOptions = struct {
+    allocator: std.mem.Allocator,
+    cache: *cache.api.Cache,
+    persist_path: ?[]const u8 = null,
+    address: std.net.Address,
+    protocol: Protocol = .auto,
+    max_connections: usize = 10_000,
+    buffer_size: usize = 4096,
+    keepalive_timeout_ns: u64 = 60 * std.time.ns_per_s,
+    backlog: u31 = 128,
+    loop_entries: u32 = 256,
+    thread_pool: ?*xev.ThreadPool = null,
+    maxmemory_bytes: ?u64 = null,
+    evict: bool = true,
+    autosweep: bool = true,
+};
+
+pub const ErrorCounts = struct {
+    accept: u64 = 0,
+    read: u64 = 0,
+    write: u64 = 0,
+    parse: u64 = 0,
+    protocol: u64 = 0,
+    pool_full: u64 = 0,
+    buffer_overflow: u64 = 0,
+    cache: u64 = 0,
+    timeout: u64 = 0,
+};
+
+pub const Metrics = struct {
+    active_connections: usize = 0,
+    total_connections: u64 = 0,
+    total_requests: u64 = 0,
+    total_responses: u64 = 0,
+    bytes_read: u64 = 0,
+    bytes_written: u64 = 0,
+    errors: ErrorCounts = .{},
+};
+
+const MetricsSnapshotFn = *const fn (*const anyopaque) Metrics;
+
+const AtomicU64 = std.atomic.Value(u64);
+const AtomicUsize = std.atomic.Value(usize);
+
+pub const AtomicErrorCounts = struct {
+    accept: AtomicU64,
+    read: AtomicU64,
+    write: AtomicU64,
+    parse: AtomicU64,
+    protocol: AtomicU64,
+    pool_full: AtomicU64,
+    buffer_overflow: AtomicU64,
+    cache: AtomicU64,
+    timeout: AtomicU64,
+
+    pub fn init() AtomicErrorCounts {
+        return .{
+            .accept = AtomicU64.init(0),
+            .read = AtomicU64.init(0),
+            .write = AtomicU64.init(0),
+            .parse = AtomicU64.init(0),
+            .protocol = AtomicU64.init(0),
+            .pool_full = AtomicU64.init(0),
+            .buffer_overflow = AtomicU64.init(0),
+            .cache = AtomicU64.init(0),
+            .timeout = AtomicU64.init(0),
+        };
+    }
+
+    pub fn snapshot(self: *const AtomicErrorCounts) ErrorCounts {
+        return .{
+            .accept = self.accept.load(.monotonic),
+            .read = self.read.load(.monotonic),
+            .write = self.write.load(.monotonic),
+            .parse = self.parse.load(.monotonic),
+            .protocol = self.protocol.load(.monotonic),
+            .pool_full = self.pool_full.load(.monotonic),
+            .buffer_overflow = self.buffer_overflow.load(.monotonic),
+            .cache = self.cache.load(.monotonic),
+            .timeout = self.timeout.load(.monotonic),
+        };
+    }
+};
+
+pub const AtomicMetrics = struct {
+    active_connections: AtomicUsize,
+    total_connections: AtomicU64,
+    total_requests: AtomicU64,
+    total_responses: AtomicU64,
+    bytes_read: AtomicU64,
+    bytes_written: AtomicU64,
+    errors: AtomicErrorCounts,
+
+    pub fn init() AtomicMetrics {
+        return .{
+            .active_connections = AtomicUsize.init(0),
+            .total_connections = AtomicU64.init(0),
+            .total_requests = AtomicU64.init(0),
+            .total_responses = AtomicU64.init(0),
+            .bytes_read = AtomicU64.init(0),
+            .bytes_written = AtomicU64.init(0),
+            .errors = AtomicErrorCounts.init(),
+        };
+    }
+
+    pub fn snapshot(self: *const AtomicMetrics) Metrics {
+        return .{
+            .active_connections = self.active_connections.load(.monotonic),
+            .total_connections = self.total_connections.load(.monotonic),
+            .total_requests = self.total_requests.load(.monotonic),
+            .total_responses = self.total_responses.load(.monotonic),
+            .bytes_read = self.bytes_read.load(.monotonic),
+            .bytes_written = self.bytes_written.load(.monotonic),
+            .errors = self.errors.snapshot(),
+        };
+    }
+};
+
+fn snapshotAtomic(ctx_ptr: *const anyopaque) Metrics {
+    const metrics = @as(*const AtomicMetrics, @ptrCast(@alignCast(ctx_ptr)));
+    return metrics.snapshot();
+}
+
+fn addU64(value: *AtomicU64, delta: u64) void {
+    _ = value.fetchAdd(delta, .monotonic);
+}
+
+fn addUsize(value: *AtomicUsize, delta: usize) void {
+    _ = value.fetchAdd(delta, .monotonic);
+}
+
+fn subUsize(value: *AtomicUsize, delta: usize) void {
+    _ = value.fetchSub(delta, .monotonic);
+}
+
+fn addErrorCounts(dst: *ErrorCounts, src: ErrorCounts) void {
+    dst.accept += src.accept;
+    dst.read += src.read;
+    dst.write += src.write;
+    dst.parse += src.parse;
+    dst.protocol += src.protocol;
+    dst.pool_full += src.pool_full;
+    dst.buffer_overflow += src.buffer_overflow;
+    dst.cache += src.cache;
+    dst.timeout += src.timeout;
+}
+
+fn addMetrics(dst: *Metrics, src: Metrics) void {
+    dst.active_connections += src.active_connections;
+    dst.total_connections += src.total_connections;
+    dst.total_requests += src.total_requests;
+    dst.total_responses += src.total_responses;
+    dst.bytes_read += src.bytes_read;
+    dst.bytes_written += src.bytes_written;
+    addErrorCounts(&dst.errors, src.errors);
+}
+
+const MetricsBatch = connection.MetricsBatch;
+
+const metrics_flush_interval_ms: u64 = 50;
+
+fn flushMetricsBatch(ctx: *ServerContext) void {
+    const batch = ctx.metrics_batch.drain();
+    if (batch.requests == 0 and batch.responses == 0) return;
+    if (batch.requests != 0) addU64(&ctx.metrics.total_requests, batch.requests);
+    if (batch.responses != 0) addU64(&ctx.metrics.total_responses, batch.responses);
+}
+
+fn flushConnectionMetrics(conn: *connection.Connection, ctx: *ServerContext) void {
+    conn.pending_metrics.drainInto(ctx.metrics_batch);
+}
+
+fn recordRequest(conn: *connection.Connection) void {
+    conn.pending_metrics.recordRequest();
+}
+
+fn recordResponse(conn: *connection.Connection) void {
+    conn.pending_metrics.recordResponse();
+}
+
+fn startMetricsFlush(ctx: *ServerContext) void {
+    if (metrics_flush_interval_ms == 0) return;
+    ctx.metrics_timer.run(ctx.loop, ctx.metrics_timer_completion, metrics_flush_interval_ms, ServerContext, ctx, onMetricsFlush);
+}
+
+fn onMetricsFlush(
+    ud: ?*ServerContext,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    const ctx = ud.?;
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        return .disarm;
+    };
+    flushMetricsBatch(ctx);
+    startMetricsFlush(ctx);
+    return .disarm;
+}
+
+fn configureSocket(tcp: xev.TCP) bool {
+    if (builtin.os.tag != .linux) return true;
+    const fd = tcp.fd();
+    const yes: c_int = 1;
+    const yes_bytes = std.mem.toBytes(yes);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, &yes_bytes) catch return false;
+    std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, &yes_bytes) catch return false;
+    std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.os.linux.TCP.QUICKACK, &yes_bytes) catch return false;
+    return true;
+}
+
+fn configureListener(tcp: xev.TCP) bool {
+    if (builtin.os.tag != .linux) return true;
+    const fd = tcp.fd();
+    const yes: c_int = 1;
+    const yes_bytes = std.mem.toBytes(yes);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &yes_bytes) catch return false;
+    return true;
+}
+
+const ServerContext = struct {
+    loop: *xev.Loop,
+    pool: *connection.ConnectionPool,
+    options: *const ServerOptions,
+    limits: Limits,
+    metrics: *AtomicMetrics,
+    metrics_snapshot: MetricsSnapshotFn,
+    metrics_snapshot_ctx: *const anyopaque,
+    start_time_ms: u64,
+    active_connections: *AtomicUsize,
+    cache: *cache.api.Cache,
+    persistence: *persistence.Manager,
+    resource_controls: ?*resource_controls.ResourceControls,
+    metrics_batch: *MetricsBatch,
+    metrics_timer: *xev.Timer,
+    metrics_timer_completion: *xev.Completion,
+};
+
+pub const Server = struct {
+    allocator: std.mem.Allocator,
+    cache: *cache.api.Cache,
+    options: ServerOptions,
+    limits: Limits,
+    loop: xev.Loop,
+    listener: xev.TCP,
+    accept_completion: xev.Completion = .{},
+    shutdown_async: xev.Async,
+    shutdown_completion: xev.Completion = .{},
+    pool: connection.ConnectionPool,
+    metrics: *AtomicMetrics,
+    owns_metrics: bool = false,
+    metrics_batch: MetricsBatch,
+    metrics_timer: xev.Timer,
+    metrics_timer_completion: xev.Completion = .{},
+    start_time_ms: u64,
+    persistence: *persistence.Manager,
+    context: ServerContext,
+    bound_address: std.net.Address,
+    resource_controls: resource_controls.ResourceControls,
+
+    pub fn init(opts: ServerOptions) !Server {
+        var server: Server = undefined;
+        try server.initInPlace(opts);
+        return server;
+    }
+
+    pub fn initInPlace(self: *Server, opts: ServerOptions) !void {
+        try xev.detect();
+        const limits = Limits{
+            .max_key_length = opts.buffer_size,
+            .max_value_length = opts.buffer_size,
+            .max_args = 32,
+        };
+        const metrics = try opts.allocator.create(AtomicMetrics);
+        metrics.* = AtomicMetrics.init();
+        errdefer opts.allocator.destroy(metrics);
+        const start_time_ms = @as(u64, @intCast(std.time.milliTimestamp()));
+        const persistence_mgr = try opts.allocator.create(persistence.Manager);
+        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persist_path);
+        errdefer opts.allocator.destroy(persistence_mgr);
+        var loop = try xev.Loop.init(.{
+            .entries = opts.loop_entries,
+            .thread_pool = opts.thread_pool,
+        });
+        errdefer loop.deinit();
+
+        var shutdown_async = try xev.Async.init();
+        errdefer shutdown_async.deinit();
+
+        const metrics_timer = try xev.Timer.init();
+
+        var listener = try xev.TCP.init(opts.address);
+        errdefer closeTcpImmediate(listener);
+        if (!configureListener(listener)) return error.SocketOptionFailed;
+        try listener.bind(opts.address);
+        try listener.listen(opts.backlog);
+
+        const bound_address = try getBoundAddress(listener);
+        var pool = try connection.ConnectionPool.init(opts.allocator, opts.max_connections, opts.buffer_size, limits);
+        errdefer pool.deinit();
+
+        self.* = Server{
+            .allocator = opts.allocator,
+            .cache = opts.cache,
+            .options = opts,
+            .limits = limits,
+            .loop = loop,
+            .listener = listener,
+            .pool = pool,
+            .metrics = metrics,
+            .owns_metrics = true,
+            .metrics_batch = .{},
+            .metrics_timer = metrics_timer,
+            .start_time_ms = start_time_ms,
+            .persistence = persistence_mgr,
+            .context = undefined,
+            .bound_address = bound_address,
+            .shutdown_async = shutdown_async,
+            .resource_controls = resource_controls.ResourceControls.init(opts.maxmemory_bytes, opts.evict, opts.autosweep),
+        };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.resource_controls.stop();
+        closeTcpImmediate(self.listener);
+        self.pool.deinit();
+        self.shutdown_async.deinit();
+        self.loop.deinit();
+        self.persistence.waitForIdle();
+        self.allocator.destroy(self.persistence);
+        if (self.owns_metrics) {
+            self.allocator.destroy(self.metrics);
+        }
+    }
+
+    pub fn run(self: *Server) !void {
+        self.context = .{
+            .loop = &self.loop,
+            .pool = &self.pool,
+            .options = &self.options,
+            .limits = self.limits,
+            .metrics = self.metrics,
+            .metrics_snapshot = snapshotAtomic,
+            .metrics_snapshot_ctx = self.metrics,
+            .start_time_ms = self.start_time_ms,
+            .active_connections = &self.metrics.active_connections,
+            .cache = self.cache,
+            .persistence = self.persistence,
+            .resource_controls = &self.resource_controls,
+            .metrics_batch = &self.metrics_batch,
+            .metrics_timer = &self.metrics_timer,
+            .metrics_timer_completion = &self.metrics_timer_completion,
+        };
+        try self.resource_controls.start(self.cache);
+        startMetricsFlush(&self.context);
+        self.shutdown_async.wait(&self.loop, &self.shutdown_completion, Server, self, onServerShutdownAsync);
+        self.queueAccept();
+        try self.loop.run(.until_done);
+        flushMetricsBatch(&self.context);
+    }
+
+    pub fn stop(self: *Server) void {
+        self.resource_controls.stop();
+        self.shutdown_async.notify() catch {};
+    }
+
+    pub fn address(self: *const Server) std.net.Address {
+        return self.bound_address;
+    }
+
+    pub fn metricsSnapshot(self: *const Server) Metrics {
+        return self.metrics.snapshot();
+    }
+
+    fn queueAccept(self: *Server) void {
+        self.listener.accept(&self.loop, &self.accept_completion, Server, self, onAccept);
+    }
+};
+
+fn onServerShutdownAsync(
+    _: ?*Server,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        return .disarm;
+    };
+    loop.stop();
+    return .disarm;
+}
+
+fn onAccept(
+    ud: ?*Server,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+
+    if (result) |tcp| {
+        addU64(&server.metrics.total_connections, 1);
+        if (!configureSocket(tcp)) {
+            addU64(&server.metrics.errors.accept, 1);
+            closeTcpImmediate(tcp);
+            server.queueAccept();
+            return .disarm;
+        }
+        if (server.pool.acquire(tcp)) |conn| {
+            conn.server = &server.context;
+            addUsize(&server.metrics.active_connections, 1);
+            startKeepalive(conn, &server.context);
+            queueRead(conn, &server.context);
+        } else {
+            addU64(&server.metrics.errors.pool_full, 1);
+            closeTcpImmediate(tcp);
+        }
+    } else |_| {
+        addU64(&server.metrics.errors.accept, 1);
+    }
+
+    server.queueAccept();
+    return .disarm;
+}
+
+fn queueRead(conn: *connection.Connection, ctx: *ServerContext) void {
+    var slice = conn.read_buf.writeSlice();
+    if (slice.len == 0) {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        closeConnection(conn, ctx);
+        return;
+    }
+    if (slice.len > conn.read_buf.availableSpace()) {
+        slice = slice[0..conn.read_buf.availableSpace()];
+    }
+    conn.read_token = conn.generation;
+    const read_buf = xev.ReadBuffer{ .slice = slice };
+    conn.tcp.read(ctx.loop, &conn.read_completion, read_buf, connection.Connection, conn, onRead);
+}
+
+fn onRead(
+    ud: ?*connection.Connection,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.TCP,
+    _: xev.ReadBuffer,
+    result: xev.ReadError!usize,
+) xev.CallbackAction {
+    const conn = ud.?;
+    if (conn.in_pool) return .disarm;
+    if (conn.read_token != conn.generation) return .disarm;
+    conn.read_token = 0;
+    const ctx = @as(*ServerContext, @ptrCast(@alignCast(conn.server.?)));
+    _ = loop;
+    defer maybeRelease(conn, ctx);
+
+    const read_len = result catch {
+        addU64(&ctx.metrics.errors.read, 1);
+        closeConnection(conn, ctx);
+        return .disarm;
+    };
+
+    if (read_len == 0) {
+        closeConnection(conn, ctx);
+        return .disarm;
+    }
+
+    conn.read_buf.commitWrite(read_len);
+    addU64(&ctx.metrics.bytes_read, @as(u64, @intCast(read_len)));
+    resetKeepalive(conn, ctx);
+
+    processIncoming(conn, ctx);
+    if (!conn.closing) {
+        queueRead(conn, ctx);
+    }
+    return .disarm;
+}
+
+fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
+    defer flushConnectionMetrics(conn, ctx);
+    while (true) {
+        if (conn.protocol == .unknown) {
+            const proto = detectProtocol(conn, ctx.options.protocol);
+            switch (proto) {
+                .needs_more => return,
+                .unknown => {
+                    addU64(&ctx.metrics.errors.protocol, 1);
+                    closeConnection(conn, ctx);
+                    return;
+                },
+                .http => conn.protocol = .http,
+                .resp => conn.protocol = .resp,
+            }
+        }
+
+        conn.read_buf.linearize(conn.scratch);
+        const data = conn.read_buf.read();
+        if (data.len == 0) return;
+
+        switch (conn.protocol) {
+            .http => {
+                const res = conn.http_parser.parse(data, false);
+                switch (res) {
+                    .ok => |parsed| {
+                        conn.keepalive = parsed.keepalive;
+                        conn.read_buf.consume(parsed.consumed);
+                        recordRequest(conn);
+                        handleHttpCommand(conn, ctx, parsed.command);
+                        if (conn.closing) return;
+                    },
+                    .needs_more => return,
+                    .err => {
+                        addU64(&ctx.metrics.errors.parse, 1);
+                        const wrote = switch (res.err) {
+                            http.Error.KeyTooLarge => writeHttpError(conn, ctx, 414, "URI Too Long"),
+                            http.Error.ValueTooLarge => writeHttpError(conn, ctx, 413, "Payload Too Large"),
+                            else => writeHttpBadRequest(conn, ctx),
+                        };
+                        if (wrote) recordResponse(conn);
+                        conn.closing = true;
+                        return;
+                    },
+                }
+            },
+            .resp => {
+                const res = conn.resp_parser.parse(data, false);
+                switch (res) {
+                    .ok => |parsed| {
+                        conn.read_buf.consume(parsed.consumed);
+                        recordRequest(conn);
+                        handleRespCommand(conn, ctx, parsed.command);
+                        if (conn.closing) return;
+                        continue;
+                    },
+                    .needs_more => return,
+                    .err => {
+                        addU64(&ctx.metrics.errors.parse, 1);
+                        const msg = if (res.err == resp.Error.ValueTooLarge) "ERR value too large" else "ERR protocol error";
+                        if (writeRespErrorResponse(conn, ctx, msg)) {
+                            recordResponse(conn);
+                        }
+                        conn.closing = true;
+                        return;
+                    },
+                }
+            },
+            .unknown => return,
+        }
+    }
+}
+
+fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: http.Command) void {
+    var snapshot: ?stats.StatsSnapshot = null;
+    switch (cmd) {
+        .stats => {
+            const metrics = ctx.metrics_snapshot(ctx.metrics_snapshot_ctx);
+            snapshot = stats.build(ctx.cache, metrics, ctx.start_time_ms);
+        },
+        else => {},
+    }
+    const result = execute.executeHttp(ctx.cache, cmd, ctx.resource_controls, conn.keepalive, &conn.write_buf, snapshot, ctx.persistence) catch {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        conn.closing = true;
+        return;
+    };
+    if (result.cache_error) addU64(&ctx.metrics.errors.cache, 1);
+    recordResponse(conn);
+    if (result.close) conn.closing = true;
+    queueWrite(conn, ctx);
+}
+
+fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: resp.Command) void {
+    var snapshot: ?stats.StatsSnapshot = null;
+    switch (cmd) {
+        .info, .stats => {
+            const metrics = ctx.metrics_snapshot(ctx.metrics_snapshot_ctx);
+            snapshot = stats.build(ctx.cache, metrics, ctx.start_time_ms);
+        },
+        else => {},
+    }
+    const result = execute.executeResp(ctx.cache, cmd, ctx.resource_controls, &conn.write_buf, snapshot, ctx.persistence) catch {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        conn.closing = true;
+        return;
+    };
+    if (result.cache_error) addU64(&ctx.metrics.errors.cache, 1);
+    recordResponse(conn);
+    queueWrite(conn, ctx);
+}
+
+fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (conn.write_in_progress) return;
+    const slice = conn.write_buf.read();
+    if (slice.len == 0) {
+        if (conn.closing) closeConnection(conn, ctx);
+        return;
+    }
+    conn.write_in_progress = true;
+    conn.write_token = conn.generation;
+    const write_buf = xev.WriteBuffer{ .slice = slice };
+    conn.tcp.write(ctx.loop, &conn.write_completion, write_buf, connection.Connection, conn, onWrite);
+}
+
+fn onWrite(
+    ud: ?*connection.Connection,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.TCP,
+    _: xev.WriteBuffer,
+    result: xev.WriteError!usize,
+) xev.CallbackAction {
+    const conn = ud.?;
+    if (conn.in_pool) return .disarm;
+    if (conn.write_token != conn.generation) return .disarm;
+    conn.write_token = 0;
+    const ctx = @as(*ServerContext, @ptrCast(@alignCast(conn.server.?)));
+    _ = loop;
+    defer maybeRelease(conn, ctx);
+
+    const written = result catch {
+        addU64(&ctx.metrics.errors.write, 1);
+        closeConnection(conn, ctx);
+        return .disarm;
+    };
+
+    conn.write_in_progress = false;
+    conn.write_buf.consume(written);
+    addU64(&ctx.metrics.bytes_written, @as(u64, @intCast(written)));
+    resetKeepalive(conn, ctx);
+    queueWrite(conn, ctx);
+    return .disarm;
+}
+
+fn maybeRelease(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (!conn.close_done) return;
+    if (conn.in_pool) return;
+    if (conn.read_token != 0) return;
+    if (conn.write_token != 0) return;
+    if (conn.timer_token != 0) return;
+    if (conn.timer_cancel_token != 0) return;
+    if (conn.close_token != 0) return;
+    ctx.pool.release(conn);
+}
+
+fn closeConnection(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (conn.in_pool or conn.close_done) return;
+    if (conn.close_queued) return;
+    if (conn.write_in_progress) {
+        conn.closing = true;
+        cancelKeepalive(conn, ctx);
+        return;
+    }
+    conn.closing = true;
+    conn.close_queued = true;
+    conn.close_token = conn.generation;
+    cancelKeepalive(conn, ctx);
+    if (builtin.os.tag != .windows) {
+        std.posix.shutdown(conn.tcp.fd(), .both) catch {};
+    }
+    conn.tcp.close(ctx.loop, &conn.close_completion, connection.Connection, conn, onCloseConnection);
+}
+
+fn onCloseConnection(
+    ud: ?*connection.Connection,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.TCP,
+    _: xev.CloseError!void,
+) xev.CallbackAction {
+    const conn = ud.?;
+    if (conn.in_pool) return .disarm;
+    if (conn.close_token != conn.generation) return .disarm;
+    const ctx = @as(*ServerContext, @ptrCast(@alignCast(conn.server.?)));
+    conn.close_token = 0;
+    conn.close_done = true;
+    subUsize(ctx.active_connections, 1);
+    defer maybeRelease(conn, ctx);
+    return .disarm;
+}
+
+const DetectResult = enum {
+    http,
+    resp,
+    needs_more,
+    unknown,
+};
+
+fn detectProtocol(conn: *connection.Connection, mode: Protocol) DetectResult {
+    if (mode == .http) return .http;
+    if (mode == .resp) return .resp;
+
+    conn.read_buf.linearize(conn.scratch);
+    const data = conn.read_buf.read();
+    if (data.len == 0) return .needs_more;
+
+    if (data[0] == '*' or data[0] == '$') return .resp;
+    if (data.len < 4) return .needs_more;
+    if (std.mem.startsWith(u8, data, "GET ") or
+        std.mem.startsWith(u8, data, "PUT ") or
+        std.mem.startsWith(u8, data, "POST ") or
+        std.mem.startsWith(u8, data, "DELETE "))
+    {
+        return .http;
+    }
+    return .unknown;
+}
+
+fn writeHttpBadRequest(conn: *connection.Connection, ctx: *ServerContext) bool {
+    return writeHttpError(conn, ctx, 400, "Bad Request");
+}
+
+fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, reason: []const u8) bool {
+    if (!writeHttpResponse(&conn.write_buf, code, reason, false)) {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        closeConnection(conn, ctx);
+        return false;
+    }
+    queueWrite(conn, ctx);
+    return true;
+}
+
+fn writeRespErrorResponse(conn: *connection.Connection, ctx: *ServerContext, msg: []const u8) bool {
+    if (!writeRespError(&conn.write_buf, msg)) {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        closeConnection(conn, ctx);
+        return false;
+    }
+    queueWrite(conn, ctx);
+    return true;
+}
+
+fn startKeepalive(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (ctx.options.keepalive_timeout_ns == 0) return;
+    const ms = @as(u64, @intCast(ctx.options.keepalive_timeout_ns / std.time.ns_per_ms));
+    conn.timer_token = conn.generation;
+    conn.timer.run(ctx.loop, &conn.timer_completion, ms, connection.Connection, conn, onKeepalive);
+}
+
+fn resetKeepalive(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (ctx.options.keepalive_timeout_ns == 0) return;
+    const ms = @as(u64, @intCast(ctx.options.keepalive_timeout_ns / std.time.ns_per_ms));
+    conn.timer_token = conn.generation;
+    conn.timer.reset(ctx.loop, &conn.timer_completion, &conn.timer_cancel, ms, connection.Connection, conn, onKeepalive);
+    if (conn.timer_cancel.state() == .active) {
+        conn.timer_cancel_token = conn.generation;
+    } else {
+        conn.timer_cancel_token = 0;
+    }
+}
+
+fn cancelKeepalive(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (ctx.options.keepalive_timeout_ns == 0) return;
+    if (conn.timer_token == 0) return;
+    if (conn.timer_cancel_token != 0) return;
+    conn.timer_cancel_token = conn.generation;
+    conn.timer.cancel(ctx.loop, &conn.timer_completion, &conn.timer_cancel, connection.Connection, conn, onKeepaliveCancel);
+}
+
+fn onKeepalive(
+    ud: ?*connection.Connection,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    const conn = ud.?;
+    if (conn.in_pool) return .disarm;
+    if (conn.timer_token != conn.generation) return .disarm;
+    conn.timer_token = 0;
+    const ctx = @as(*ServerContext, @ptrCast(@alignCast(conn.server.?)));
+    defer maybeRelease(conn, ctx);
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        addU64(&ctx.metrics.errors.timeout, 1);
+        closeConnection(conn, ctx);
+        return .disarm;
+    };
+    addU64(&ctx.metrics.errors.timeout, 1);
+    closeConnection(conn, ctx);
+    return .disarm;
+}
+
+fn onKeepaliveCancel(
+    ud: ?*connection.Connection,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.Timer.CancelError!void,
+) xev.CallbackAction {
+    const conn = ud orelse return .disarm;
+    if (conn.in_pool) return .disarm;
+    if (conn.timer_cancel_token != conn.generation) return .disarm;
+    conn.timer_cancel_token = 0;
+    const ctx = @as(*ServerContext, @ptrCast(@alignCast(conn.server.?)));
+    defer maybeRelease(conn, ctx);
+    return .disarm;
+}
+
+fn closeTcpImmediate(tcp: xev.TCP) void {
+    if (builtin.os.tag == .windows) return;
+    std.posix.close(tcp.fd());
+}
+
+fn writeHttpResponse(out: *buffer.RingBuffer, code: u16, reason: []const u8, keepalive: bool) bool {
+    var header_buf: [256]u8 = undefined;
+    const conn = if (keepalive) "keep-alive" else "close";
+    const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: {s}\r\n\r\n", .{
+        code,
+        reason,
+        conn,
+    }) catch return false;
+    return writeAll(out, header);
+}
+
+fn writeRespError(out: *buffer.RingBuffer, msg: []const u8) bool {
+    return writeAll(out, "-") and writeAll(out, msg) and writeAll(out, "\r\n");
+}
+
+fn writeAll(out: *buffer.RingBuffer, data: []const u8) bool {
+    if (data.len == 0) return true;
+    if (out.availableSpace() < data.len) return false;
+    return out.write(data) == data.len;
+}
+
+fn getBoundAddress(listener: xev.TCP) !std.net.Address {
+    var addr: std.posix.sockaddr align(4) = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(listener.fd(), &addr, &len);
+    return std.net.Address.initPosix(&addr);
+}
+
+const WorkerQueue = struct {
+    fds: []std.posix.fd_t,
+    head: usize = 0,
+    tail: usize = 0,
+    len: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !WorkerQueue {
+        const cap = if (capacity == 0) 1 else capacity;
+        const fds = try allocator.alloc(std.posix.fd_t, cap);
+        return .{ .fds = fds };
+    }
+
+    pub fn deinit(self: *WorkerQueue, allocator: std.mem.Allocator) void {
+        allocator.free(self.fds);
+    }
+
+    pub fn push(self: *WorkerQueue, fd: std.posix.fd_t) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.len == self.fds.len) return false;
+        self.fds[self.tail] = fd;
+        self.tail = (self.tail + 1) % self.fds.len;
+        self.len += 1;
+        return true;
+    }
+
+    pub fn pop(self: *WorkerQueue) ?std.posix.fd_t {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.len == 0) return null;
+        const fd = self.fds[self.head];
+        self.head = (self.head + 1) % self.fds.len;
+        self.len -= 1;
+        if (self.len == 0) {
+            self.head = 0;
+            self.tail = 0;
+        }
+        return fd;
+    }
+};
+
+const Worker = struct {
+    allocator: std.mem.Allocator,
+    id: usize,
+    loop: xev.Loop,
+    pool: connection.ConnectionPool,
+    queue: WorkerQueue,
+    async: xev.Async,
+    async_completion: xev.Completion = .{},
+    thread: ?std.Thread = null,
+    options: ServerOptions,
+    limits: Limits,
+    context: ServerContext,
+    connections: AtomicU64,
+    metrics: AtomicMetrics,
+    metrics_batch: MetricsBatch,
+    metrics_timer: xev.Timer,
+    metrics_timer_completion: xev.Completion = .{},
+
+    fn initInPlace(
+        self: *Worker,
+        allocator: std.mem.Allocator,
+        id: usize,
+        cache_ptr: *cache.api.Cache,
+        active_connections: *AtomicUsize,
+        options: ServerOptions,
+        pool_size: usize,
+        queue_capacity: usize,
+        limits: Limits,
+        persistence_ptr: *persistence.Manager,
+        metrics_snapshot: MetricsSnapshotFn,
+        metrics_snapshot_ctx: *const anyopaque,
+        start_time_ms: u64,
+    ) !void {
+        var loop = try xev.Loop.init(.{
+            .entries = options.loop_entries,
+            .thread_pool = options.thread_pool,
+        });
+        errdefer loop.deinit();
+
+        var pool = try connection.ConnectionPool.init(allocator, pool_size, options.buffer_size, limits);
+        errdefer pool.deinit();
+
+        var queue = try WorkerQueue.init(allocator, queue_capacity);
+        errdefer queue.deinit(allocator);
+
+        const async = try xev.Async.init();
+        errdefer async.deinit();
+
+        const metrics_timer = try xev.Timer.init();
+
+        self.* = Worker{
+            .allocator = allocator,
+            .id = id,
+            .loop = loop,
+            .pool = pool,
+            .queue = queue,
+            .async = async,
+            .options = options,
+            .limits = limits,
+            .context = undefined,
+            .connections = AtomicU64.init(0),
+            .metrics = AtomicMetrics.init(),
+            .metrics_batch = .{},
+            .metrics_timer = metrics_timer,
+        };
+        self.context = .{
+            .loop = &self.loop,
+            .pool = &self.pool,
+            .options = &self.options,
+            .limits = limits,
+            .metrics = &self.metrics,
+            .metrics_snapshot = metrics_snapshot,
+            .metrics_snapshot_ctx = metrics_snapshot_ctx,
+            .start_time_ms = start_time_ms,
+            .active_connections = active_connections,
+            .cache = cache_ptr,
+            .persistence = persistence_ptr,
+            .resource_controls = null,
+            .metrics_batch = &self.metrics_batch,
+            .metrics_timer = &self.metrics_timer,
+            .metrics_timer_completion = &self.metrics_timer_completion,
+        };
+    }
+
+    fn start(self: *Worker) !void {
+        self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
+    }
+
+    fn stop(self: *Worker) void {
+        self.loop.stop();
+        self.async.notify() catch {};
+    }
+
+    fn join(self: *Worker) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn deinit(self: *Worker) void {
+        self.pool.deinit();
+        self.queue.deinit(self.allocator);
+        self.async.deinit();
+        self.loop.deinit();
+    }
+};
+
+const ThreadedMetricsContext = struct {
+    base: *AtomicMetrics,
+    workers: []Worker,
+};
+
+fn snapshotThreaded(ctx_ptr: *const anyopaque) Metrics {
+    const ctx = @as(*const ThreadedMetricsContext, @ptrCast(@alignCast(ctx_ptr)));
+    var metrics = ctx.base.snapshot();
+    for (ctx.workers) |*worker| {
+        addMetrics(&metrics, worker.metrics.snapshot());
+    }
+    return metrics;
+}
+
+fn workerMain(worker: *Worker) void {
+    startMetricsFlush(&worker.context);
+    worker.async.wait(&worker.loop, &worker.async_completion, Worker, worker, onWorkerAsync);
+    worker.loop.run(.until_done) catch {};
+    flushMetricsBatch(&worker.context);
+}
+
+fn onWorkerAsync(
+    ud: ?*Worker,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    const worker = ud.?;
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        return .disarm;
+    };
+
+    while (worker.queue.pop()) |fd| {
+        const tcp = xev.TCP.initFd(fd);
+        if (worker.pool.acquire(tcp)) |conn| {
+            conn.server = &worker.context;
+            addU64(&worker.connections, 1);
+            startKeepalive(conn, &worker.context);
+            queueRead(conn, &worker.context);
+        } else {
+            addU64(&worker.context.metrics.errors.pool_full, 1);
+            subUsize(worker.context.active_connections, 1);
+            closeTcpImmediate(tcp);
+        }
+    }
+
+    return .rearm;
+}
+
+pub const ThreadedServer = struct {
+    allocator: std.mem.Allocator,
+    cache: *cache.api.Cache,
+    options: ServerOptions,
+    threads: usize,
+    metrics: *AtomicMetrics,
+    start_time_ms: u64,
+    persistence: *persistence.Manager,
+    loop: xev.Loop,
+    listener: xev.TCP,
+    accept_completion: xev.Completion = .{},
+    shutdown_async: xev.Async,
+    shutdown_completion: xev.Completion = .{},
+    workers: []Worker,
+    metrics_context: *ThreadedMetricsContext,
+    next_worker: AtomicUsize,
+    bound_address: std.net.Address,
+    resource_controls: resource_controls.ResourceControls,
+
+    pub fn init(opts: ServerOptions, threads: usize) !ThreadedServer {
+        try xev.detect();
+        const limits = Limits{
+            .max_key_length = opts.buffer_size,
+            .max_value_length = opts.buffer_size,
+            .max_args = 32,
+        };
+
+        const resolved_threads = if (threads == 0)
+            std.Thread.getCpuCount() catch 1
+        else
+            threads;
+        const worker_count = if (resolved_threads == 0) 1 else resolved_threads;
+
+        const metrics = try opts.allocator.create(AtomicMetrics);
+        metrics.* = AtomicMetrics.init();
+        errdefer opts.allocator.destroy(metrics);
+        const start_time_ms = @as(u64, @intCast(std.time.milliTimestamp()));
+        const persistence_mgr = try opts.allocator.create(persistence.Manager);
+        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persist_path);
+        errdefer opts.allocator.destroy(persistence_mgr);
+
+        var loop = try xev.Loop.init(.{
+            .entries = opts.loop_entries,
+            .thread_pool = opts.thread_pool,
+        });
+        errdefer loop.deinit();
+
+        var shutdown_async = try xev.Async.init();
+        errdefer shutdown_async.deinit();
+
+        var listener = try xev.TCP.init(opts.address);
+        errdefer closeTcpImmediate(listener);
+        if (!configureListener(listener)) return error.SocketOptionFailed;
+        try listener.bind(opts.address);
+        try listener.listen(opts.backlog);
+
+        const bound_address = try getBoundAddress(listener);
+
+        var workers = try opts.allocator.alloc(Worker, worker_count);
+        var inited: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < inited) : (idx += 1) {
+                workers[idx].stop();
+            }
+            idx = 0;
+            while (idx < inited) : (idx += 1) {
+                workers[idx].join();
+                workers[idx].deinit();
+            }
+            opts.allocator.free(workers);
+        }
+
+        const metrics_context = try opts.allocator.create(ThreadedMetricsContext);
+        metrics_context.* = .{
+            .base = metrics,
+            .workers = workers,
+        };
+        errdefer opts.allocator.destroy(metrics_context);
+
+        var i: usize = 0;
+        const base = opts.max_connections / worker_count;
+        const extra = opts.max_connections % worker_count;
+        while (i < worker_count) : (i += 1) {
+            const bump: usize = if (i < extra) 1 else 0;
+            const pool_size = base + bump;
+            const queue_cap = if (pool_size < 64) 64 else pool_size;
+            var worker_opts = opts;
+            worker_opts.max_connections = pool_size;
+            try workers[i].initInPlace(
+                opts.allocator,
+                i,
+                opts.cache,
+                &metrics.active_connections,
+                worker_opts,
+                pool_size,
+                queue_cap,
+                limits,
+                persistence_mgr,
+                snapshotThreaded,
+                metrics_context,
+                start_time_ms,
+            );
+            inited += 1;
+        }
+
+        i = 0;
+        while (i < worker_count) : (i += 1) {
+            try workers[i].start();
+        }
+
+        return .{
+            .allocator = opts.allocator,
+            .cache = opts.cache,
+            .options = opts,
+            .threads = worker_count,
+            .metrics = metrics,
+            .start_time_ms = start_time_ms,
+            .persistence = persistence_mgr,
+            .loop = loop,
+            .listener = listener,
+            .workers = workers,
+            .metrics_context = metrics_context,
+            .next_worker = AtomicUsize.init(0),
+            .bound_address = bound_address,
+            .shutdown_async = shutdown_async,
+            .resource_controls = resource_controls.ResourceControls.init(opts.maxmemory_bytes, opts.evict, opts.autosweep),
+        };
+    }
+
+    pub fn deinit(self: *ThreadedServer) void {
+        self.stop();
+        var i: usize = 0;
+        while (i < self.workers.len) : (i += 1) {
+            self.workers[i].join();
+            self.workers[i].deinit();
+        }
+        self.allocator.free(self.workers);
+        self.allocator.destroy(self.metrics_context);
+        self.resource_controls.stop();
+        closeTcpImmediate(self.listener);
+        self.shutdown_async.deinit();
+        self.loop.deinit();
+        self.persistence.waitForIdle();
+        self.allocator.destroy(self.persistence);
+        self.allocator.destroy(self.metrics);
+    }
+
+    pub fn run(self: *ThreadedServer) !void {
+        for (self.workers) |*worker| {
+            worker.context.resource_controls = &self.resource_controls;
+        }
+        try self.resource_controls.start(self.cache);
+        self.shutdown_async.wait(&self.loop, &self.shutdown_completion, ThreadedServer, self, onThreadedShutdownAsync);
+        self.queueAccept();
+        try self.loop.run(.until_done);
+    }
+
+    pub fn stop(self: *ThreadedServer) void {
+        self.resource_controls.stop();
+        self.shutdown_async.notify() catch {};
+        for (self.workers) |*worker| {
+            worker.stop();
+        }
+    }
+
+    pub fn address(self: *const ThreadedServer) std.net.Address {
+        return self.bound_address;
+    }
+
+    pub fn metricsSnapshot(self: *const ThreadedServer) Metrics {
+        var metrics = self.metrics.snapshot();
+        for (self.workers) |*worker| {
+            addMetrics(&metrics, worker.metrics.snapshot());
+        }
+        return metrics;
+    }
+
+    fn queueAccept(self: *ThreadedServer) void {
+        self.listener.accept(&self.loop, &self.accept_completion, ThreadedServer, self, onThreadedAccept);
+    }
+
+    fn dispatch(self: *ThreadedServer, fd: std.posix.fd_t) bool {
+        if (self.workers.len == 0) return false;
+        const idx = self.next_worker.fetchAdd(1, .monotonic) % self.workers.len;
+        const worker = &self.workers[idx];
+        if (!worker.queue.push(fd)) return false;
+        worker.async.notify() catch {};
+        return true;
+    }
+};
+
+fn onThreadedShutdownAsync(
+    _: ?*ThreadedServer,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        return .disarm;
+    };
+    loop.stop();
+    return .disarm;
+}
+
+fn onThreadedAccept(
+    ud: ?*ThreadedServer,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+
+    if (result) |tcp| {
+        addU64(&server.metrics.total_connections, 1);
+        if (!configureSocket(tcp)) {
+            addU64(&server.metrics.errors.accept, 1);
+            closeTcpImmediate(tcp);
+            server.queueAccept();
+            return .disarm;
+        }
+        const active = server.metrics.active_connections.fetchAdd(1, .monotonic) + 1;
+        if (active > server.options.max_connections) {
+            subUsize(&server.metrics.active_connections, 1);
+            addU64(&server.metrics.errors.pool_full, 1);
+            closeTcpImmediate(tcp);
+        } else if (!server.dispatch(tcp.fd())) {
+            subUsize(&server.metrics.active_connections, 1);
+            addU64(&server.metrics.errors.pool_full, 1);
+            closeTcpImmediate(tcp);
+        }
+    } else |_| {
+        addU64(&server.metrics.errors.accept, 1);
+    }
+
+    server.queueAccept();
+    return .disarm;
+}
+
+const TestServer = struct {
+    server: *Server,
+    thread: std.Thread,
+
+    fn start(opts: ServerOptions) !TestServer {
+        const server_ptr = try opts.allocator.create(Server);
+        errdefer opts.allocator.destroy(server_ptr);
+        try server_ptr.initInPlace(opts);
+        errdefer server_ptr.deinit();
+        const thread = try std.Thread.spawn(.{}, Server.run, .{server_ptr});
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        return .{ .server = server_ptr, .thread = thread };
+    }
+
+    fn stop(self: *TestServer) void {
+        self.shutdown();
+        self.deinit();
+    }
+
+    fn shutdown(self: *TestServer) void {
+        self.server.stop();
+        self.thread.join();
+    }
+
+    fn deinit(self: *TestServer) void {
+        self.server.deinit();
+        self.server.allocator.destroy(self.server);
+    }
+};
+
+const TestThreadedServer = struct {
+    server: *ThreadedServer,
+    thread: std.Thread,
+
+    fn start(opts: ServerOptions, threads: usize) !TestThreadedServer {
+        const server_ptr = try opts.allocator.create(ThreadedServer);
+        errdefer opts.allocator.destroy(server_ptr);
+        server_ptr.* = try ThreadedServer.init(opts, threads);
+        errdefer server_ptr.deinit();
+        const thread = try std.Thread.spawn(.{}, ThreadedServer.run, .{server_ptr});
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        return .{ .server = server_ptr, .thread = thread };
+    }
+
+    fn stop(self: *TestThreadedServer) void {
+        self.shutdown();
+        self.deinit();
+    }
+
+    fn shutdown(self: *TestThreadedServer) void {
+        self.server.stop();
+        self.thread.join();
+    }
+
+    fn deinit(self: *TestThreadedServer) void {
+        self.server.deinit();
+        self.server.allocator.destroy(self.server);
+    }
+};
+
+fn connectRetry(addr: std.net.Address) !std.net.Stream {
+    var attempt: usize = 0;
+    while (attempt < 10) : (attempt += 1) {
+        if (std.net.tcpConnectToAddress(addr)) |stream| {
+            return stream;
+        } else |_| {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    return error.ConnectionRefused;
+}
+
+fn readHttpResponse(stream: *std.net.Stream, buf: []u8) ![]const u8 {
+    var used: usize = 0;
+    while (used < buf.len) {
+        const n = try stream.reader().read(buf[used..]);
+        if (n == 0) break;
+        used += n;
+        if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n")) |idx| {
+            const header_end = idx + 4;
+            const length = parseContentLength(buf[0..header_end]);
+            if (used >= header_end + length) {
+                return buf[0 .. header_end + length];
+            }
+        }
+    }
+    return error.UnexpectedEof;
+}
+
+fn parseContentLength(header: []const u8) usize {
+    const needle = "Content-Length:";
+    if (std.mem.indexOf(u8, header, needle)) |idx| {
+        var i = idx + needle.len;
+        while (i < header.len and (header[i] == ' ' or header[i] == '\t')) : (i += 1) {}
+        const end = std.mem.indexOfScalarPos(u8, header, i, '\r') orelse header.len;
+        return std.fmt.parseInt(usize, header[i..end], 10) catch 0;
+    }
+    return 0;
+}
+
+fn waitForMetricsSnapshot(server: anytype, min_requests: u64, min_responses: u64) Metrics {
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        const metrics = server.metricsSnapshot();
+        if (metrics.total_requests >= min_requests and metrics.total_responses >= min_responses) {
+            return metrics;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return server.metricsSnapshot();
+}
+
+test "server accepts HTTP connections" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    const bound = harness.server.address();
+    var stream = try connectRetry(bound);
+    defer stream.close();
+
+    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    const res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "404") != null);
+}
+
+test "http end-to-end commands with keepalive" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .auto,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("POST /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nv");
+    var buf: [512]u8 = undefined;
+    var res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "201") != null);
+
+    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\n\r\nv") != null);
+
+    try stream.writer().writeAll("PUT /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nvv");
+    res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
+
+    try stream.writer().writeAll("DELETE /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
+}
+
+test "http ops endpoints return health and stats" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("GET /@health HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    var res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\n\r\nOK") != null);
+
+    try stream.writer().writeAll("GET /@stats HTTP/1.1\r\nConnection: close\r\n\r\n");
+    res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "\"server\"") != null);
+}
+
+test "http malformed request returns 400 and closes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .auto,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("TRACE /k HTTP/1.1\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    const res = try readHttpResponse(&stream, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, res, "400") != null);
+    const n = try stream.reader().read(&buf);
+    try std.testing.expect(n == 0);
+}
+
+fn churnWorker(addr: std.net.Address, iterations: usize, sleep_ns: u64) void {
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const stream = std.net.tcpConnectToAddress(addr) catch continue;
+        if (i % 3 == 0) {
+            std.Thread.sleep(sleep_ns);
+        } else if (i % 3 == 1) {
+            stream.writer().writeAll("GET /k HTTP/1.1\r\n") catch {};
+        } else {
+            stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch {};
+        }
+        stream.close();
+    }
+}
+
+test "threaded server connection churn" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestThreadedServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .auto,
+        .buffer_size = 4096,
+        .keepalive_timeout_ns = 5 * std.time.ns_per_ms,
+    }, 2);
+    defer harness.stop();
+
+    const worker_count = 4;
+    const iterations = 300;
+    const sleep_ns = 10 * std.time.ns_per_ms;
+
+    var threads: [worker_count]std.Thread = undefined;
+    var i: usize = 0;
+    while (i < worker_count) : (i += 1) {
+        threads[i] = try std.Thread.spawn(.{}, churnWorker, .{ harness.server.address(), iterations, sleep_ns });
+    }
+    for (threads) |thread| {
+        thread.join();
+    }
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+}
+
+test "resp end-to-end and pipeline" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .auto,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+    var buf: [256]u8 = undefined;
+    var n = try stream.reader().read(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "+OK") != null);
+
+    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    n = try stream.reader().read(&buf);
+    const out = buf[0..n];
+    try std.testing.expect(std.mem.count(u8, out, "$1\r\n1\r\n") == 2);
+}
+
+test "resp ops commands return pong and stats" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("*1\r\n$4\r\nPING\r\n");
+    var buf: [1024]u8 = undefined;
+    var n = try stream.reader().read(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "+PONG") != null);
+
+    try stream.writer().writeAll("*1\r\n$4\r\nINFO\r\n");
+    n = try stream.reader().read(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "cache.items") != null);
+
+    try stream.writer().writeAll("*1\r\n$5\r\nSTATS\r\n");
+    n = try stream.reader().read(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "cache.items") != null);
+}
+
+test "resp malformed request returns error and closes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .buffer_size = 4096,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$4\r\nshort\r\n");
+    var buf: [256]u8 = undefined;
+    const n = try stream.reader().read(&buf);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "-ERR") != null);
+    const n2 = try stream.reader().read(&buf);
+    try std.testing.expect(n2 == 0);
+}
+
+test "concurrent connections" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+        .max_connections = 16,
+    });
+    defer harness.stop();
+
+    const bound = harness.server.address();
+    var threads: [8]std.Thread = undefined;
+    var i: usize = 0;
+    while (i < threads.len) : (i += 1) {
+        threads[i] = try std.Thread.spawn(.{}, struct {
+            fn run(address: std.net.Address) void {
+                var stream = std.net.tcpConnectToAddress(address) catch return;
+                defer stream.close();
+                stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch return;
+                var buf: [128]u8 = undefined;
+                _ = stream.reader().read(&buf) catch return;
+            }
+        }.run, .{bound});
+    }
+    for (threads) |t| t.join();
+}
+
+test "metrics snapshot tracks requests and bytes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+    });
+    var stopped = false;
+    defer if (!stopped) harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    _ = try readHttpResponse(&stream, &buf);
+
+    harness.shutdown();
+    const metrics = waitForMetricsSnapshot(harness.server, 1, 1);
+    harness.deinit();
+    stopped = true;
+
+    try std.testing.expectEqual(@as(usize, 0), metrics.active_connections);
+    try std.testing.expect(metrics.total_connections >= 1);
+    try std.testing.expect(metrics.total_requests >= 1);
+    try std.testing.expect(metrics.total_responses >= 1);
+    try std.testing.expect(metrics.bytes_read > 0);
+    try std.testing.expect(metrics.bytes_written > 0);
+}
+
+test "pool exhaustion increments pool_full" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+        .max_connections = 1,
+    });
+    var stopped = false;
+    defer if (!stopped) harness.stop();
+
+    var stream1 = try connectRetry(harness.server.address());
+    var stream1_closed = false;
+    defer if (!stream1_closed) stream1.close();
+    try stream1.writer().writeAll("GET /a HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    _ = try readHttpResponse(&stream1, &buf);
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    var stream2 = try connectRetry(harness.server.address());
+    defer stream2.close();
+    try stream2.writer().writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+    var buf2: [128]u8 = undefined;
+    const n = try stream2.reader().read(&buf2);
+    if (n > 0) {
+        try std.testing.expect(std.mem.indexOf(u8, buf2[0..n], "HTTP/1.1") == null);
+    }
+
+    stream1.close();
+    stream1_closed = true;
+
+    harness.shutdown();
+    const metrics = harness.server.metricsSnapshot();
+    harness.deinit();
+    stopped = true;
+
+    try std.testing.expect(metrics.errors.pool_full >= 1);
+}
+
+test "threaded server dispatches across workers" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestThreadedServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .http,
+        .buffer_size = 4096,
+        .max_connections = 8,
+    }, 2);
+    var stopped = false;
+    defer if (!stopped) harness.stop();
+
+    const bound = harness.server.address();
+    var stream1 = try connectRetry(bound);
+    defer stream1.close();
+    try stream1.writer().writeAll("GET /a HTTP/1.1\r\nConnection: close\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    _ = try readHttpResponse(&stream1, &buf);
+
+    var stream2 = try connectRetry(bound);
+    defer stream2.close();
+    try stream2.writer().writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+    _ = try readHttpResponse(&stream2, &buf);
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    harness.shutdown();
+    const metrics = waitForMetricsSnapshot(harness.server, 2, 2);
+    const w0 = harness.server.workers[0].connections.load(.monotonic);
+    const w1 = harness.server.workers[1].connections.load(.monotonic);
+    harness.deinit();
+    stopped = true;
+
+    try std.testing.expect(metrics.total_connections >= 2);
+    try std.testing.expect(metrics.total_requests >= 2);
+    try std.testing.expect(metrics.active_connections == 0);
+    try std.testing.expect(w0 > 0);
+    try std.testing.expect(w1 > 0);
+}
