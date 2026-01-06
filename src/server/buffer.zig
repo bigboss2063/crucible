@@ -80,14 +80,17 @@ pub const RingBuffer = struct {
     }
 
     pub fn linearize(self: *RingBuffer, scratch: []u8) void {
-        if (self.len == 0 or self.head <= self.tail) return;
+        if (self.len == 0) return;
+        if (self.head < self.tail) return;
+        if (self.head == self.tail and self.len < self.buf.len) return;
+        if (self.head == 0) return;
         const first_len = self.buf.len - self.head;
         std.debug.assert(scratch.len >= first_len);
         std.mem.copyForwards(u8, scratch[0..first_len], self.buf[self.head .. self.head + first_len]);
         std.mem.copyBackwards(u8, self.buf[first_len .. first_len + self.tail], self.buf[0..self.tail]);
         std.mem.copyForwards(u8, self.buf[0..first_len], scratch[0..first_len]);
         self.head = 0;
-        self.tail = self.len;
+        self.tail = if (self.len == self.buf.len) 0 else self.len;
     }
 };
 
@@ -149,4 +152,17 @@ test "ring buffer write slice and commit" {
     var scratch: [6]u8 = undefined;
     rb.linearize(&scratch);
     try std.testing.expectEqualSlices(u8, "cdef", rb.read());
+}
+
+test "ring buffer linearize full wrap" {
+    var storage: [6]u8 = undefined;
+    var rb = RingBuffer.init(&storage);
+
+    _ = rb.write("abcdef");
+    rb.consume(2);
+    _ = rb.write("gh");
+
+    var scratch: [6]u8 = undefined;
+    rb.linearize(&scratch);
+    try std.testing.expectEqualSlices(u8, "cdefgh", rb.read());
 }
