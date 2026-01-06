@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.linkLibC();
     if (profile) {
         exe.root_module.omit_frame_pointer = false;
         exe.root_module.strip = false;
@@ -85,6 +86,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.linkLibC();
     if (profile) {
         exe_tests.root_module.omit_frame_pointer = false;
         exe_tests.root_module.strip = false;
