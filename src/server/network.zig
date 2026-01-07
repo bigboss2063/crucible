@@ -27,7 +27,10 @@ pub const ServerOptions = struct {
     address: std.net.Address,
     protocol: Protocol = .auto,
     max_connections: usize = 10_000,
-    buffer_size: usize = 4096,
+    read_buffer_bytes: usize = 16 * 1024,
+    write_buffer_bytes: usize = 16 * 1024,
+    max_request_bytes: usize = 1024 * 1024,
+    max_response_bytes: usize = 1024 * 1024,
     keepalive_timeout_ns: u64 = 60 * std.time.ns_per_s,
     backlog: u31 = 128,
     loop_entries: u32 = 256,
@@ -241,6 +244,64 @@ fn configureListener(tcp: xev.TCP) bool {
     return true;
 }
 
+const PersistNotify = struct {
+    allocator: std.mem.Allocator,
+    queue: *PersistQueue,
+    async: *xev.Async,
+    conn: *connection.Connection,
+    generation: u64,
+    ok: bool = false,
+    next: ?*PersistNotify = null,
+};
+
+const PersistQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    head: ?*PersistNotify = null,
+    tail: ?*PersistNotify = null,
+
+    pub fn init() PersistQueue {
+        return .{};
+    }
+
+    pub fn deinit(self: *PersistQueue) void {
+        self.mutex.lock();
+        var node = self.head;
+        self.head = null;
+        self.tail = null;
+        self.mutex.unlock();
+
+        while (node) |notify| {
+            const next = notify.next;
+            notify.allocator.destroy(notify);
+            node = next;
+        }
+    }
+
+    pub fn push(self: *PersistQueue, notify: *PersistNotify) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        notify.next = null;
+        if (self.tail) |tail| {
+            tail.next = notify;
+        } else {
+            self.head = notify;
+        }
+        self.tail = notify;
+    }
+
+    pub fn pop(self: *PersistQueue) ?*PersistNotify {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const head = self.head orelse return null;
+        self.head = head.next;
+        if (self.head == null) {
+            self.tail = null;
+        }
+        head.next = null;
+        return head;
+    }
+};
+
 const ServerContext = struct {
     loop: *xev.Loop,
     pool: *connection.ConnectionPool,
@@ -253,6 +314,8 @@ const ServerContext = struct {
     active_connections: *AtomicUsize,
     cache: *cache.api.Cache,
     persistence: *persistence.Manager,
+    persist_queue: *PersistQueue,
+    persist_async: *xev.Async,
     resource_controls: ?*resource_controls.ResourceControls,
     metrics_batch: *MetricsBatch,
     metrics_timer: *xev.Timer,
@@ -269,6 +332,9 @@ pub const Server = struct {
     accept_completion: xev.Completion = .{},
     shutdown_async: xev.Async,
     shutdown_completion: xev.Completion = .{},
+    persist_queue: PersistQueue,
+    persist_async: xev.Async,
+    persist_async_completion: xev.Completion = .{},
     pool: connection.ConnectionPool,
     metrics: *AtomicMetrics,
     owns_metrics: bool = false,
@@ -289,9 +355,12 @@ pub const Server = struct {
 
     pub fn initInPlace(self: *Server, opts: ServerOptions) !void {
         try xev.detect();
+        if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
+        if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
+        if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
         const limits = Limits{
-            .max_key_length = opts.buffer_size,
-            .max_value_length = opts.buffer_size,
+            .max_key_length = opts.max_request_bytes,
+            .max_value_length = opts.max_request_bytes,
             .max_args = 32,
         };
         const metrics = try opts.allocator.create(AtomicMetrics);
@@ -310,6 +379,9 @@ pub const Server = struct {
         var shutdown_async = try xev.Async.init();
         errdefer shutdown_async.deinit();
 
+        var persist_async = try xev.Async.init();
+        errdefer persist_async.deinit();
+
         const metrics_timer = try xev.Timer.init();
 
         var listener = try xev.TCP.init(opts.address);
@@ -319,7 +391,15 @@ pub const Server = struct {
         try listener.listen(opts.backlog);
 
         const bound_address = try getBoundAddress(listener);
-        var pool = try connection.ConnectionPool.init(opts.allocator, opts.max_connections, opts.buffer_size, limits);
+        var pool = try connection.ConnectionPool.init(
+            opts.allocator,
+            opts.max_connections,
+            opts.read_buffer_bytes,
+            opts.write_buffer_bytes,
+            opts.max_request_bytes,
+            opts.max_response_bytes,
+            limits,
+        );
         errdefer pool.deinit();
 
         self.* = Server{
@@ -339,6 +419,8 @@ pub const Server = struct {
             .context = undefined,
             .bound_address = bound_address,
             .shutdown_async = shutdown_async,
+            .persist_queue = PersistQueue.init(),
+            .persist_async = persist_async,
             .resource_controls = resource_controls.ResourceControls.init(opts.maxmemory_bytes, opts.evict, opts.autosweep),
         };
     }
@@ -346,10 +428,13 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.resource_controls.stop();
         closeTcpImmediate(self.listener);
+        self.persistence.waitForIdle();
+        self.persistence.drainPendingPath();
         self.pool.deinit();
         self.shutdown_async.deinit();
+        self.persist_async.deinit();
+        self.persist_queue.deinit();
         self.loop.deinit();
-        self.persistence.waitForIdle();
         self.allocator.destroy(self.persistence);
         if (self.owns_metrics) {
             self.allocator.destroy(self.metrics);
@@ -369,6 +454,8 @@ pub const Server = struct {
             .active_connections = &self.metrics.active_connections,
             .cache = self.cache,
             .persistence = self.persistence,
+            .persist_queue = &self.persist_queue,
+            .persist_async = &self.persist_async,
             .resource_controls = &self.resource_controls,
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
@@ -377,6 +464,7 @@ pub const Server = struct {
         try self.resource_controls.start(self.cache);
         startMetricsFlush(&self.context);
         self.shutdown_async.wait(&self.loop, &self.shutdown_completion, Server, self, onServerShutdownAsync);
+        self.persist_async.wait(&self.loop, &self.persist_async_completion, Server, self, onServerPersistAsync);
         self.queueAccept();
         try self.loop.run(.until_done);
         flushMetricsBatch(&self.context);
@@ -414,6 +502,35 @@ fn onServerShutdownAsync(
     return .disarm;
 }
 
+fn onServerPersistAsync(
+    ud: ?*Server,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = result catch |err| {
+        if (err == error.Canceled) return .disarm;
+        return .disarm;
+    };
+    drainPersistQueue(&server.context);
+    return .rearm;
+}
+
+fn persistNotify(ctx_ptr: *anyopaque, ok: bool) void {
+    const ctx = @as(*PersistNotify, @ptrCast(@alignCast(ctx_ptr)));
+    ctx.ok = ok;
+    ctx.queue.push(ctx);
+    ctx.async.notify() catch {};
+}
+
+fn drainPersistQueue(ctx: *ServerContext) void {
+    while (ctx.persist_queue.pop()) |notify| {
+        handlePersistCompletion(ctx, notify);
+        notify.allocator.destroy(notify);
+    }
+}
+
 fn onAccept(
     ud: ?*Server,
     loop: *xev.Loop,
@@ -449,15 +566,22 @@ fn onAccept(
 }
 
 fn queueRead(conn: *connection.Connection, ctx: *ServerContext) void {
-    var slice = conn.read_buf.writeSlice();
+    const read_chunk = ctx.options.read_buffer_bytes;
+    const needs_reserve = !conn.read_needs_more or conn.read_buf.availableTail() < read_chunk;
+    if (needs_reserve) {
+        if (!conn.read_buf.reserve(read_chunk)) {
+            addU64(&ctx.metrics.errors.buffer_overflow, 1);
+            closeConnection(conn, ctx);
+            return;
+        }
+    }
+    var slice = conn.read_buf.tailSlice();
     if (slice.len == 0) {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         closeConnection(conn, ctx);
         return;
     }
-    if (slice.len > conn.read_buf.availableSpace()) {
-        slice = slice[0..conn.read_buf.availableSpace()];
-    }
+    if (slice.len > read_chunk) slice = slice[0..read_chunk];
     conn.read_token = conn.generation;
     const read_buf = xev.ReadBuffer{ .slice = slice };
     conn.tcp.read(ctx.loop, &conn.read_completion, read_buf, connection.Connection, conn, onRead);
@@ -495,7 +619,7 @@ fn onRead(
     resetKeepalive(conn, ctx);
 
     processIncoming(conn, ctx);
-    if (!conn.closing) {
+    if (!conn.closing and conn.persist_state == .idle) {
         queueRead(conn, ctx);
     }
     return .disarm;
@@ -518,8 +642,7 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
             }
         }
 
-        conn.read_buf.linearize(conn.scratch);
-        const data = conn.read_buf.read();
+        const data = conn.read_buf.readable();
         if (data.len == 0) return;
 
         switch (conn.protocol) {
@@ -527,14 +650,20 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
                 const res = conn.http_parser.parse(data, false);
                 switch (res) {
                     .ok => |parsed| {
+                        conn.read_needs_more = false;
                         conn.keepalive = parsed.keepalive;
                         conn.read_buf.consume(parsed.consumed);
                         recordRequest(conn);
                         handleHttpCommand(conn, ctx, parsed.command);
+                        if (conn.persist_state != .idle) return;
                         if (conn.closing) return;
                     },
-                    .needs_more => return,
+                    .needs_more => {
+                        conn.read_needs_more = true;
+                        return;
+                    },
                     .err => {
+                        conn.read_needs_more = false;
                         addU64(&ctx.metrics.errors.parse, 1);
                         const wrote = switch (res.err) {
                             http.Error.KeyTooLarge => writeHttpError(conn, ctx, 414, "URI Too Long"),
@@ -551,14 +680,20 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
                 const res = conn.resp_parser.parse(data, false);
                 switch (res) {
                     .ok => |parsed| {
+                        conn.read_needs_more = false;
                         conn.read_buf.consume(parsed.consumed);
                         recordRequest(conn);
                         handleRespCommand(conn, ctx, parsed.command);
+                        if (conn.persist_state != .idle) return;
                         if (conn.closing) return;
                         continue;
                     },
-                    .needs_more => return,
+                    .needs_more => {
+                        conn.read_needs_more = true;
+                        return;
+                    },
                     .err => {
+                        conn.read_needs_more = false;
                         addU64(&ctx.metrics.errors.parse, 1);
                         const msg = if (res.err == resp.Error.ValueTooLarge) "ERR value too large" else "ERR protocol error";
                         if (writeRespErrorResponse(conn, ctx, msg)) {
@@ -575,6 +710,18 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
 }
 
 fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: http.Command) void {
+    switch (cmd) {
+        .save => |save_cmd| {
+            _ = handlePersistCommand(conn, ctx, true, save_cmd.path, save_cmd.fast);
+            return;
+        },
+        .load => |load_cmd| {
+            _ = handlePersistCommand(conn, ctx, false, load_cmd.path, load_cmd.fast);
+            return;
+        },
+        else => {},
+    }
+
     var snapshot: ?stats.StatsSnapshot = null;
     switch (cmd) {
         .stats => {
@@ -583,7 +730,16 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
         },
         else => {},
     }
-    const result = execute.executeHttp(ctx.cache, cmd, ctx.resource_controls, conn.keepalive, &conn.write_buf, snapshot, ctx.persistence) catch {
+    const allow_resize = !conn.write_in_progress;
+    const result = execute.executeHttp(
+        ctx.cache,
+        cmd,
+        ctx.resource_controls,
+        conn.keepalive,
+        &conn.write_buf,
+        allow_resize,
+        snapshot,
+    ) catch {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         conn.closing = true;
         return;
@@ -595,6 +751,18 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
 }
 
 fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: resp.Command) void {
+    switch (cmd) {
+        .save => |save_cmd| {
+            _ = handlePersistCommand(conn, ctx, true, save_cmd.path, save_cmd.fast);
+            return;
+        },
+        .load => |load_cmd| {
+            _ = handlePersistCommand(conn, ctx, false, load_cmd.path, load_cmd.fast);
+            return;
+        },
+        else => {},
+    }
+
     var snapshot: ?stats.StatsSnapshot = null;
     switch (cmd) {
         .info, .stats => {
@@ -603,7 +771,15 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
         },
         else => {},
     }
-    const result = execute.executeResp(ctx.cache, cmd, ctx.resource_controls, &conn.write_buf, snapshot, ctx.persistence) catch {
+    const allow_resize = !conn.write_in_progress;
+    const result = execute.executeResp(
+        ctx.cache,
+        cmd,
+        ctx.resource_controls,
+        &conn.write_buf,
+        allow_resize,
+        snapshot,
+    ) catch {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         conn.closing = true;
         return;
@@ -613,9 +789,175 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
     queueWrite(conn, ctx);
 }
 
+fn handlePersistCommand(
+    conn: *connection.Connection,
+    ctx: *ServerContext,
+    is_save: bool,
+    path_override: ?[]const u8,
+    fast: bool,
+) bool {
+    const allocator = ctx.options.allocator;
+    const notify = allocator.create(PersistNotify) catch {
+        if (!writePersistFailure(conn, ctx, "ERR persistence failed", 500, "Internal Server Error")) {
+            addU64(&ctx.metrics.errors.buffer_overflow, 1);
+            conn.closing = true;
+        }
+        return false;
+    };
+    notify.* = .{
+        .allocator = allocator,
+        .queue = ctx.persist_queue,
+        .async = ctx.persist_async,
+        .conn = conn,
+        .generation = conn.generation,
+    };
+
+    conn.persist_state = .in_progress;
+    conn.persist_response_ok = false;
+    conn.persist_close_after = conn.protocol == .http and !conn.keepalive;
+
+    const status = if (is_save)
+        ctx.persistence.startSave(path_override, fast, notify, persistNotify)
+    else
+        ctx.persistence.startLoad(path_override, fast, notify, persistNotify);
+
+    switch (status) {
+        .ok => {
+            cancelKeepalive(conn, ctx);
+            return true;
+        },
+        .disabled => {
+            conn.persist_state = .idle;
+            conn.persist_close_after = false;
+            allocator.destroy(notify);
+            if (!writePersistFailure(conn, ctx, "ERR path not provided", 400, "Bad Request")) {
+                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                conn.closing = true;
+            }
+        },
+        .busy_save => {
+            conn.persist_state = .idle;
+            conn.persist_close_after = false;
+            allocator.destroy(notify);
+            if (!writePersistFailure(conn, ctx, "ERR save already in progress", 409, "Conflict")) {
+                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                conn.closing = true;
+            }
+        },
+        .busy_load => {
+            conn.persist_state = .idle;
+            conn.persist_close_after = false;
+            allocator.destroy(notify);
+            if (!writePersistFailure(conn, ctx, "ERR load already in progress", 409, "Conflict")) {
+                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                conn.closing = true;
+            }
+        },
+        .failed => {
+            conn.persist_state = .idle;
+            conn.persist_close_after = false;
+            allocator.destroy(notify);
+            if (!writePersistFailure(conn, ctx, "ERR persistence failed", 500, "Internal Server Error")) {
+                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                conn.closing = true;
+            }
+        },
+    }
+    return false;
+}
+
+fn writePersistFailure(
+    conn: *connection.Connection,
+    ctx: *ServerContext,
+    resp_msg: []const u8,
+    http_code: u16,
+    http_reason: []const u8,
+) bool {
+    const allow_resize = !conn.write_in_progress;
+    const wrote = switch (conn.protocol) {
+        .http => writeHttpResponse(&conn.write_buf, allow_resize, http_code, http_reason, conn.keepalive),
+        .resp => writeRespError(&conn.write_buf, allow_resize, resp_msg),
+        .unknown => false,
+    };
+    if (!wrote) return false;
+    recordResponse(conn);
+    if (conn.protocol == .http and !conn.keepalive) {
+        conn.closing = true;
+    }
+    queueWrite(conn, ctx);
+    return true;
+}
+
+fn handlePersistCompletion(ctx: *ServerContext, notify: *PersistNotify) void {
+    const conn = notify.conn;
+    if (conn.in_pool) return;
+    if (conn.generation != notify.generation) return;
+    if (conn.persist_state == .idle) return;
+    if (conn.closing or conn.close_queued or conn.close_done) {
+        conn.persist_state = .idle;
+        conn.persist_close_after = false;
+        return;
+    }
+    finishPersistResponse(conn, ctx, notify.ok);
+}
+
+fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: bool) void {
+    if (conn.write_in_progress) {
+        conn.persist_state = .response_pending;
+        conn.persist_response_ok = ok;
+        return;
+    }
+
+    const wrote = switch (conn.protocol) {
+        .http => if (ok)
+            writeHttpResponseWithBody(&conn.write_buf, true, 200, "OK", "OK", conn.keepalive)
+        else
+            writeHttpResponse(&conn.write_buf, true, 500, "Internal Server Error", conn.keepalive),
+        .resp => if (ok)
+            writeRespSimple(&conn.write_buf, true, "OK")
+        else
+            writeRespError(&conn.write_buf, true, "ERR persistence failed"),
+        .unknown => false,
+    };
+
+    if (!wrote) {
+        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+        conn.closing = true;
+        conn.persist_state = .idle;
+        conn.persist_close_after = false;
+        return;
+    }
+
+    conn.persist_state = .idle;
+    conn.persist_response_ok = false;
+    if (conn.persist_close_after) {
+        conn.persist_close_after = false;
+        conn.closing = true;
+    } else {
+        conn.persist_close_after = false;
+    }
+
+    recordResponse(conn);
+    if (!conn.closing) {
+        resetKeepalive(conn, ctx);
+    }
+    queueWrite(conn, ctx);
+
+    if (!conn.closing) {
+        if (conn.read_buf.readable().len > 0) {
+            processIncoming(conn, ctx);
+            if (!conn.closing and conn.persist_state == .idle) {
+                queueRead(conn, ctx);
+            }
+        } else {
+            queueRead(conn, ctx);
+        }
+    }
+}
+
 fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
     if (conn.write_in_progress) return;
-    const slice = conn.write_buf.read();
+    const slice = conn.write_buf.readable();
     if (slice.len == 0) {
         if (conn.closing) closeConnection(conn, ctx);
         return;
@@ -651,8 +993,14 @@ fn onWrite(
     conn.write_in_progress = false;
     conn.write_buf.consume(written);
     addU64(&ctx.metrics.bytes_written, @as(u64, @intCast(written)));
-    resetKeepalive(conn, ctx);
-    queueWrite(conn, ctx);
+    if (conn.persist_state == .idle) {
+        resetKeepalive(conn, ctx);
+    }
+    if (conn.persist_state == .response_pending) {
+        finishPersistResponse(conn, ctx, conn.persist_response_ok);
+    } else {
+        queueWrite(conn, ctx);
+    }
     return .disarm;
 }
 
@@ -714,8 +1062,7 @@ fn detectProtocol(conn: *connection.Connection, mode: Protocol) DetectResult {
     if (mode == .http) return .http;
     if (mode == .resp) return .resp;
 
-    conn.read_buf.linearize(conn.scratch);
-    const data = conn.read_buf.read();
+    const data = conn.read_buf.readable();
     if (data.len == 0) return .needs_more;
 
     if (data[0] == '*' or data[0] == '$') return .resp;
@@ -735,7 +1082,8 @@ fn writeHttpBadRequest(conn: *connection.Connection, ctx: *ServerContext) bool {
 }
 
 fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, reason: []const u8) bool {
-    if (!writeHttpResponse(&conn.write_buf, code, reason, false)) {
+    const allow_resize = !conn.write_in_progress;
+    if (!writeHttpResponse(&conn.write_buf, allow_resize, code, reason, false)) {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         closeConnection(conn, ctx);
         return false;
@@ -745,7 +1093,8 @@ fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, 
 }
 
 fn writeRespErrorResponse(conn: *connection.Connection, ctx: *ServerContext, msg: []const u8) bool {
-    if (!writeRespError(&conn.write_buf, msg)) {
+    const allow_resize = !conn.write_in_progress;
+    if (!writeRespError(&conn.write_buf, allow_resize, msg)) {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         closeConnection(conn, ctx);
         return false;
@@ -824,7 +1173,28 @@ fn closeTcpImmediate(tcp: xev.TCP) void {
     std.posix.close(tcp.fd());
 }
 
-fn writeHttpResponse(out: *buffer.RingBuffer, code: u16, reason: []const u8, keepalive: bool) bool {
+fn writeHttpResponseWithBody(
+    out: *buffer.LinearBuffer,
+    allow_resize: bool,
+    code: u16,
+    reason: []const u8,
+    body: []const u8,
+    keepalive: bool,
+) bool {
+    var header_buf: [256]u8 = undefined;
+    const conn = if (keepalive) "keep-alive" else "close";
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+        .{ code, reason, body.len, conn },
+    ) catch return false;
+    if (!ensureWritable(out, allow_resize, header.len + body.len)) return false;
+    appendUnchecked(out, header);
+    appendUnchecked(out, body);
+    return true;
+}
+
+fn writeHttpResponse(out: *buffer.LinearBuffer, allow_resize: bool, code: u16, reason: []const u8, keepalive: bool) bool {
     var header_buf: [256]u8 = undefined;
     const conn = if (keepalive) "keep-alive" else "close";
     const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: {s}\r\n\r\n", .{
@@ -832,17 +1202,47 @@ fn writeHttpResponse(out: *buffer.RingBuffer, code: u16, reason: []const u8, kee
         reason,
         conn,
     }) catch return false;
-    return writeAll(out, header);
+    return writeAll(out, allow_resize, header);
 }
 
-fn writeRespError(out: *buffer.RingBuffer, msg: []const u8) bool {
-    return writeAll(out, "-") and writeAll(out, msg) and writeAll(out, "\r\n");
+fn writeRespSimple(out: *buffer.LinearBuffer, allow_resize: bool, msg: []const u8) bool {
+    if (!ensureWritable(out, allow_resize, 1 + msg.len + 2)) return false;
+    appendUnchecked(out, "+");
+    appendUnchecked(out, msg);
+    appendUnchecked(out, "\r\n");
+    return true;
 }
 
-fn writeAll(out: *buffer.RingBuffer, data: []const u8) bool {
+fn writeRespError(out: *buffer.LinearBuffer, allow_resize: bool, msg: []const u8) bool {
+    if (!ensureWritable(out, allow_resize, 1 + msg.len + 2)) return false;
+    appendUnchecked(out, "-");
+    appendUnchecked(out, msg);
+    appendUnchecked(out, "\r\n");
+    return true;
+}
+
+fn ensureWritable(out: *buffer.LinearBuffer, allow_resize: bool, len: usize) bool {
+    if (len == 0) return true;
+    if (allow_resize) {
+        if (!out.reserve(len)) return false;
+    } else {
+        if (out.availableTail() < len) return false;
+    }
+    return true;
+}
+
+fn appendUnchecked(out: *buffer.LinearBuffer, data: []const u8) void {
+    if (data.len == 0) return;
+    std.debug.assert(out.availableTail() >= data.len);
+    std.mem.copyForwards(u8, out.tailSlice()[0..data.len], data);
+    out.commitWrite(data.len);
+}
+
+fn writeAll(out: *buffer.LinearBuffer, allow_resize: bool, data: []const u8) bool {
     if (data.len == 0) return true;
-    if (out.availableSpace() < data.len) return false;
-    return out.write(data) == data.len;
+    if (!ensureWritable(out, allow_resize, data.len)) return false;
+    appendUnchecked(out, data);
+    return true;
 }
 
 fn getBoundAddress(listener: xev.TCP) !std.net.Address {
@@ -900,6 +1300,7 @@ const Worker = struct {
     loop: xev.Loop,
     pool: connection.ConnectionPool,
     queue: WorkerQueue,
+    persist_queue: PersistQueue,
     async: xev.Async,
     async_completion: xev.Completion = .{},
     thread: ?std.Thread = null,
@@ -933,7 +1334,15 @@ const Worker = struct {
         });
         errdefer loop.deinit();
 
-        var pool = try connection.ConnectionPool.init(allocator, pool_size, options.buffer_size, limits);
+        var pool = try connection.ConnectionPool.init(
+            allocator,
+            pool_size,
+            options.read_buffer_bytes,
+            options.write_buffer_bytes,
+            options.max_request_bytes,
+            options.max_response_bytes,
+            limits,
+        );
         errdefer pool.deinit();
 
         var queue = try WorkerQueue.init(allocator, queue_capacity);
@@ -950,6 +1359,7 @@ const Worker = struct {
             .loop = loop,
             .pool = pool,
             .queue = queue,
+            .persist_queue = PersistQueue.init(),
             .async = async,
             .options = options,
             .limits = limits,
@@ -971,6 +1381,8 @@ const Worker = struct {
             .active_connections = active_connections,
             .cache = cache_ptr,
             .persistence = persistence_ptr,
+            .persist_queue = &self.persist_queue,
+            .persist_async = &self.async,
             .resource_controls = null,
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
@@ -997,6 +1409,7 @@ const Worker = struct {
     fn deinit(self: *Worker) void {
         self.pool.deinit();
         self.queue.deinit(self.allocator);
+        self.persist_queue.deinit();
         self.async.deinit();
         self.loop.deinit();
     }
@@ -1034,6 +1447,8 @@ fn onWorkerAsync(
         if (err == error.Canceled) return .disarm;
         return .disarm;
     };
+
+    drainPersistQueue(&worker.context);
 
     while (worker.queue.pop()) |fd| {
         const tcp = xev.TCP.initFd(fd);
@@ -1073,9 +1488,12 @@ pub const ThreadedServer = struct {
 
     pub fn init(opts: ServerOptions, threads: usize) !ThreadedServer {
         try xev.detect();
+        if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
+        if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
+        if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
         const limits = Limits{
-            .max_key_length = opts.buffer_size,
-            .max_value_length = opts.buffer_size,
+            .max_key_length = opts.max_request_bytes,
+            .max_value_length = opts.max_request_bytes,
             .max_args = 32,
         };
 
@@ -1184,6 +1602,8 @@ pub const ThreadedServer = struct {
 
     pub fn deinit(self: *ThreadedServer) void {
         self.stop();
+        self.persistence.waitForIdle();
+        self.persistence.drainPendingPath();
         var i: usize = 0;
         while (i < self.workers.len) : (i += 1) {
             self.workers[i].join();
@@ -1195,7 +1615,6 @@ pub const ThreadedServer = struct {
         closeTcpImmediate(self.listener);
         self.shutdown_async.deinit();
         self.loop.deinit();
-        self.persistence.waitForIdle();
         self.allocator.destroy(self.persistence);
         self.allocator.destroy(self.metrics);
     }
@@ -1418,7 +1837,8 @@ test "server accepts HTTP connections" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1445,7 +1865,8 @@ test "http end-to-end commands with keepalive" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1484,7 +1905,8 @@ test "http ops endpoints return health and stats" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1516,7 +1938,8 @@ test "http malformed request returns 400 and closes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1559,7 +1982,8 @@ test "threaded server connection churn" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
         .keepalive_timeout_ns = 5 * std.time.ns_per_ms,
     }, 2);
     defer harness.stop();
@@ -1592,7 +2016,8 @@ test "resp end-to-end and pipeline" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1623,7 +2048,8 @@ test "resp ops commands return pong and stats" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .resp,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1657,7 +2083,8 @@ test "resp malformed request returns error and closes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .resp,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1686,7 +2113,8 @@ test "concurrent connections" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
         .max_connections = 16,
     });
     defer harness.stop();
@@ -1721,7 +2149,8 @@ test "metrics snapshot tracks requests and bytes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     var stopped = false;
     defer if (!stopped) harness.stop();
@@ -1759,7 +2188,8 @@ test "pool exhaustion increments pool_full" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
         .max_connections = 1,
     });
     var stopped = false;
@@ -1806,7 +2236,8 @@ test "threaded server dispatches across workers" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
         .max_connections = 8,
     }, 2);
     var stopped = false;

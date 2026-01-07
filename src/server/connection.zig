@@ -13,6 +13,12 @@ pub const Protocol = enum {
     resp,
 };
 
+pub const PersistState = enum {
+    idle,
+    in_progress,
+    response_pending,
+};
+
 pub const MetricsBatch = struct {
     requests: u64 = 0,
     responses: u64 = 0,
@@ -48,16 +54,17 @@ pub const Connection = struct {
     id: usize,
     tcp: xev.TCP,
     server: ?*anyopaque,
-    read_storage: []u8,
-    write_storage: []u8,
-    scratch: []u8,
-    read_buf: buffer.RingBuffer,
-    write_buf: buffer.RingBuffer,
+    read_buf: buffer.LinearBuffer,
+    write_buf: buffer.LinearBuffer,
     protocol: Protocol,
     http_parser: http.Parser,
     resp_parser: resp.Parser,
     keepalive: bool,
     write_in_progress: bool,
+    read_needs_more: bool,
+    persist_state: PersistState,
+    persist_response_ok: bool,
+    persist_close_after: bool,
     closing: bool,
     close_queued: bool,
     close_done: bool,
@@ -79,25 +86,31 @@ pub const Connection = struct {
 
     pub fn init(
         id: usize,
-        read_storage: []u8,
-        write_storage: []u8,
-        scratch: []u8,
+        allocator: std.mem.Allocator,
+        read_buffer_bytes: usize,
+        write_buffer_bytes: usize,
+        max_request_bytes: usize,
+        max_response_bytes: usize,
         limits: Limits,
     ) !Connection {
+        var read_buf = try buffer.LinearBuffer.init(allocator, read_buffer_bytes, max_request_bytes);
+        errdefer read_buf.deinit();
+        const write_buf = try buffer.LinearBuffer.init(allocator, write_buffer_bytes, max_response_bytes);
         return .{
             .id = id,
             .tcp = undefined,
             .server = null,
-            .read_storage = read_storage,
-            .write_storage = write_storage,
-            .scratch = scratch,
-            .read_buf = buffer.RingBuffer.init(read_storage),
-            .write_buf = buffer.RingBuffer.init(write_storage),
+            .read_buf = read_buf,
+            .write_buf = write_buf,
             .protocol = .unknown,
             .http_parser = http.Parser.init(limits),
             .resp_parser = resp.Parser.init(limits),
             .keepalive = false,
             .write_in_progress = false,
+            .read_needs_more = false,
+            .persist_state = .idle,
+            .persist_response_ok = false,
+            .persist_close_after = false,
             .closing = false,
             .close_queued = false,
             .close_done = false,
@@ -124,6 +137,10 @@ pub const Connection = struct {
         self.resp_parser = resp.Parser.init(limits);
         self.keepalive = false;
         self.write_in_progress = false;
+        self.read_needs_more = false;
+        self.persist_state = .idle;
+        self.persist_response_ok = false;
+        self.persist_close_after = false;
         self.closing = false;
         self.close_queued = false;
         self.close_done = false;
@@ -151,13 +168,19 @@ pub const ConnectionPool = struct {
     conns: []Connection,
     free: []usize,
     free_len: usize,
-    buffer_size: usize,
+    read_buffer_bytes: usize,
+    write_buffer_bytes: usize,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
     limits: Limits,
 
     pub fn init(
         allocator: std.mem.Allocator,
         max_connections: usize,
-        buffer_size: usize,
+        read_buffer_bytes: usize,
+        write_buffer_bytes: usize,
+        max_request_bytes: usize,
+        max_response_bytes: usize,
         limits: Limits,
     ) !ConnectionPool {
         var conns = try allocator.alloc(Connection, max_connections);
@@ -167,13 +190,15 @@ pub const ConnectionPool = struct {
 
         var i: usize = 0;
         while (i < max_connections) : (i += 1) {
-            const read_storage = try allocator.alloc(u8, buffer_size);
-            errdefer allocator.free(read_storage);
-            const write_storage = try allocator.alloc(u8, buffer_size);
-            errdefer allocator.free(write_storage);
-            const scratch = try allocator.alloc(u8, buffer_size);
-            errdefer allocator.free(scratch);
-            conns[i] = try Connection.init(i, read_storage, write_storage, scratch, limits);
+            conns[i] = try Connection.init(
+                i,
+                allocator,
+                read_buffer_bytes,
+                write_buffer_bytes,
+                max_request_bytes,
+                max_response_bytes,
+                limits,
+            );
             free[i] = max_connections - 1 - i;
         }
 
@@ -182,16 +207,18 @@ pub const ConnectionPool = struct {
             .conns = conns,
             .free = free,
             .free_len = max_connections,
-            .buffer_size = buffer_size,
+            .read_buffer_bytes = read_buffer_bytes,
+            .write_buffer_bytes = write_buffer_bytes,
+            .max_request_bytes = max_request_bytes,
+            .max_response_bytes = max_response_bytes,
             .limits = limits,
         };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
         for (self.conns) |*conn| {
-            self.allocator.free(conn.read_storage);
-            self.allocator.free(conn.write_storage);
-            self.allocator.free(conn.scratch);
+            conn.read_buf.deinit();
+            conn.write_buf.deinit();
         }
         self.allocator.free(self.conns);
         self.allocator.free(self.free);
@@ -214,9 +241,12 @@ pub const ConnectionPool = struct {
         if (conn.in_pool) return;
         conn.read_buf.clear();
         conn.write_buf.clear();
+        conn.read_buf.shrinkToInit();
+        conn.write_buf.shrinkToInit();
         conn.protocol = .unknown;
         conn.keepalive = false;
         conn.write_in_progress = false;
+        conn.read_needs_more = false;
         conn.closing = false;
         conn.close_queued = false;
         conn.close_done = false;
@@ -237,7 +267,12 @@ test "connection pool acquire and release" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var pool = try ConnectionPool.init(allocator, 2, 64, .{});
+    const limits = Limits{
+        .max_key_length = 64,
+        .max_value_length = 64,
+        .max_args = 32,
+    };
+    var pool = try ConnectionPool.init(allocator, 2, 64, 64, 64, 64, limits);
     defer pool.deinit();
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);

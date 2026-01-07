@@ -1,168 +1,179 @@
 const std = @import("std");
 
-pub const RingBuffer = struct {
-    buf: []u8,
-    head: usize,
-    tail: usize,
+pub const LinearBuffer = struct {
+    allocator: std.mem.Allocator,
+    storage: []u8,
+    start: usize,
     len: usize,
+    init_cap: usize,
+    max_cap: usize,
 
-    pub fn init(buf: []u8) RingBuffer {
-        std.debug.assert(buf.len > 0);
+    fn assertInvariants(self: *const LinearBuffer) void {
+        std.debug.assert(self.start + self.len <= self.storage.len);
+        std.debug.assert(self.storage.len >= self.init_cap);
+        std.debug.assert(self.max_cap >= self.init_cap);
+    }
+
+    pub fn init(allocator: std.mem.Allocator, init_cap: usize, max_cap: usize) !LinearBuffer {
+        if (init_cap == 0 or max_cap < init_cap) return error.InvalidCapacity;
+        const storage = try allocator.alloc(u8, init_cap);
         return .{
-            .buf = buf,
-            .head = 0,
-            .tail = 0,
+            .allocator = allocator,
+            .storage = storage,
+            .start = 0,
             .len = 0,
+            .init_cap = init_cap,
+            .max_cap = max_cap,
         };
     }
 
-    pub fn availableSpace(self: *const RingBuffer) usize {
-        return self.buf.len - self.len;
-    }
-
-    pub fn read(self: *const RingBuffer) []const u8 {
-        if (self.len == 0) return self.buf[0..0];
-        const end = if (self.tail > self.head and self.len < self.buf.len) self.tail else self.buf.len;
-        return self.buf[self.head..end];
-    }
-
-    pub fn writeSlice(self: *RingBuffer) []u8 {
-        if (self.len == self.buf.len) return self.buf[0..0];
-        if (self.tail >= self.head and self.len < self.buf.len) {
-            return self.buf[self.tail..self.buf.len];
-        }
-        return self.buf[self.tail..self.head];
-    }
-
-    pub fn commitWrite(self: *RingBuffer, n: usize) void {
-        if (n == 0) return;
-        const space = self.availableSpace();
-        std.debug.assert(n <= space);
-        self.tail = (self.tail + n) % self.buf.len;
-        self.len += n;
-    }
-
-    pub fn write(self: *RingBuffer, data: []const u8) usize {
-        if (data.len == 0) return 0;
-        const space = self.availableSpace();
-        if (space == 0) return 0;
-
-        const to_write = @min(space, data.len);
-        const first = @min(to_write, self.buf.len - self.tail);
-        std.mem.copyForwards(u8, self.buf[self.tail .. self.tail + first], data[0..first]);
-
-        const remaining = to_write - first;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.buf[0..remaining], data[first .. first + remaining]);
-        }
-
-        self.tail = (self.tail + to_write) % self.buf.len;
-        self.len += to_write;
-        return to_write;
-    }
-
-    pub fn consume(self: *RingBuffer, n: usize) void {
-        if (self.len == 0 or n == 0) return;
-        const take = @min(n, self.len);
-        self.head = (self.head + take) % self.buf.len;
-        self.len -= take;
-
-        if (self.len == 0) {
-            self.head = 0;
-            self.tail = 0;
-        }
-    }
-
-    pub fn clear(self: *RingBuffer) void {
-        self.head = 0;
-        self.tail = 0;
+    pub fn deinit(self: *LinearBuffer) void {
+        self.assertInvariants();
+        self.allocator.free(self.storage);
+        self.storage = &.{};
+        self.start = 0;
         self.len = 0;
     }
 
-    pub fn linearize(self: *RingBuffer, scratch: []u8) void {
-        if (self.len == 0) return;
-        if (self.head < self.tail) return;
-        if (self.head == self.tail and self.len < self.buf.len) return;
-        if (self.head == 0) return;
-        const first_len = self.buf.len - self.head;
-        std.debug.assert(scratch.len >= first_len);
-        std.mem.copyForwards(u8, scratch[0..first_len], self.buf[self.head .. self.head + first_len]);
-        std.mem.copyBackwards(u8, self.buf[first_len .. first_len + self.tail], self.buf[0..self.tail]);
-        std.mem.copyForwards(u8, self.buf[0..first_len], scratch[0..first_len]);
-        self.head = 0;
-        self.tail = if (self.len == self.buf.len) 0 else self.len;
+    pub fn clear(self: *LinearBuffer) void {
+        self.assertInvariants();
+        self.start = 0;
+        self.len = 0;
+    }
+
+    pub fn readable(self: *const LinearBuffer) []const u8 {
+        self.assertInvariants();
+        return self.storage[self.start .. self.start + self.len];
+    }
+
+    pub fn availableTail(self: *const LinearBuffer) usize {
+        self.assertInvariants();
+        return self.storage.len - (self.start + self.len);
+    }
+
+    pub fn tailSlice(self: *LinearBuffer) []u8 {
+        self.assertInvariants();
+        return self.storage[self.start + self.len .. self.storage.len];
+    }
+
+    pub fn reserve(self: *LinearBuffer, min_free: usize) bool {
+        self.assertInvariants();
+        if (min_free == 0) return true;
+        if (self.len + min_free > self.max_cap) return false;
+        self.compactIfNeeded(min_free);
+        if (self.availableTail() >= min_free) return true;
+        if (!self.grow(min_free)) return false;
+        return self.availableTail() >= min_free;
+    }
+
+    pub fn commitWrite(self: *LinearBuffer, n: usize) void {
+        self.assertInvariants();
+        if (n == 0) return;
+        std.debug.assert(n <= self.availableTail());
+        self.len += n;
+    }
+
+    pub fn write(self: *LinearBuffer, data: []const u8) bool {
+        self.assertInvariants();
+        if (data.len == 0) return true;
+        if (!self.reserve(data.len)) return false;
+        std.mem.copyForwards(u8, self.tailSlice()[0..data.len], data);
+        self.commitWrite(data.len);
+        return true;
+    }
+
+    pub fn consume(self: *LinearBuffer, n: usize) void {
+        self.assertInvariants();
+        if (self.len == 0 or n == 0) return;
+        const take = @min(n, self.len);
+        self.start += take;
+        self.len -= take;
+        if (self.len == 0) {
+            self.start = 0;
+        }
+    }
+
+    pub fn shrinkToInit(self: *LinearBuffer) void {
+        self.assertInvariants();
+        if (self.storage.len <= self.init_cap) return;
+        if (self.len != 0) return;
+        const resized = self.allocator.realloc(self.storage, self.init_cap) catch return;
+        self.storage = resized;
+        self.start = 0;
+    }
+
+    fn compactIfNeeded(self: *LinearBuffer, min_free: usize) void {
+        self.assertInvariants();
+        if (self.start == 0) return;
+        const cap = self.storage.len;
+        const available = cap - (self.start + self.len);
+        const threshold = cap / 2;
+        if (available >= min_free and self.start < threshold) return;
+        if (self.len > 0) {
+            std.mem.copyForwards(u8, self.storage[0..self.len], self.storage[self.start .. self.start + self.len]);
+        }
+        self.start = 0;
+    }
+
+    fn grow(self: *LinearBuffer, min_free: usize) bool {
+        self.assertInvariants();
+        const needed = self.len + min_free;
+        if (needed > self.max_cap) return false;
+        var new_cap = self.storage.len;
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+        if (new_cap > self.max_cap) {
+            new_cap = self.max_cap;
+        }
+        if (new_cap == self.storage.len) return true;
+        const resized = self.allocator.realloc(self.storage, new_cap) catch return false;
+        self.storage = resized;
+        return true;
     }
 };
 
-test "ring buffer basic write/read/consume" {
-    var storage: [8]u8 = undefined;
-    var rb = RingBuffer.init(&storage);
+test "linear buffer basic write/read/consume" {
+    var storage = try LinearBuffer.init(std.testing.allocator, 8, 16);
+    defer storage.deinit();
 
-    try std.testing.expectEqual(@as(usize, 8), rb.availableSpace());
-    const n1 = rb.write("abcd");
-    try std.testing.expectEqual(@as(usize, 4), n1);
-    try std.testing.expectEqualSlices(u8, "abcd", rb.read());
+    try std.testing.expect(storage.write("abcd"));
+    try std.testing.expectEqualSlices(u8, "abcd", storage.readable());
 
-    rb.consume(2);
-    try std.testing.expectEqualSlices(u8, "cd", rb.read());
-    try std.testing.expectEqual(@as(usize, 6), rb.availableSpace());
+    storage.consume(2);
+    try std.testing.expectEqualSlices(u8, "cd", storage.readable());
 }
 
-test "ring buffer wrap around" {
-    var storage: [8]u8 = undefined;
-    var rb = RingBuffer.init(&storage);
+test "linear buffer compacts on demand" {
+    var buf = try LinearBuffer.init(std.testing.allocator, 8, 8);
+    defer buf.deinit();
 
-    _ = rb.write("abcdef");
-    rb.consume(4);
-    _ = rb.write("wxyz");
+    try std.testing.expect(buf.write("abcdef"));
+    buf.consume(4);
+    try std.testing.expectEqualSlices(u8, "ef", buf.readable());
 
-    try std.testing.expectEqualSlices(u8, "efwx", rb.read());
-    rb.consume(4);
-    try std.testing.expectEqualSlices(u8, "yz", rb.read());
+    try std.testing.expect(buf.reserve(6));
+    try std.testing.expectEqual(@as(usize, 0), buf.start);
+    try std.testing.expectEqualSlices(u8, "ef", buf.readable());
+    try std.testing.expect(buf.write("ghij"));
+    try std.testing.expectEqualSlices(u8, "efghij", buf.readable());
 }
 
-test "ring buffer partial write" {
-    var storage: [4]u8 = undefined;
-    var rb = RingBuffer.init(&storage);
+test "linear buffer grows to max" {
+    var buf = try LinearBuffer.init(std.testing.allocator, 4, 16);
+    defer buf.deinit();
 
-    const n1 = rb.write("abc");
-    try std.testing.expectEqual(@as(usize, 3), n1);
-    const n2 = rb.write("def");
-    try std.testing.expectEqual(@as(usize, 1), n2);
-    try std.testing.expectEqualSlices(u8, "abcd", rb.read());
-
-    rb.consume(4);
-    try std.testing.expectEqual(@as(usize, 4), rb.availableSpace());
+    try std.testing.expect(buf.write("abcd"));
+    try std.testing.expect(buf.reserve(6));
+    try std.testing.expect(buf.storage.len >= 10);
+    try std.testing.expect(buf.write("efghij"));
+    try std.testing.expectEqualSlices(u8, "abcdefghij", buf.readable());
 }
 
-test "ring buffer write slice and commit" {
-    var storage: [6]u8 = undefined;
-    var rb = RingBuffer.init(&storage);
+test "linear buffer refuses over max" {
+    var buf = try LinearBuffer.init(std.testing.allocator, 4, 8);
+    defer buf.deinit();
 
-    var slice = rb.writeSlice();
-    try std.testing.expectEqual(@as(usize, 6), slice.len);
-    std.mem.copyForwards(u8, slice[0..3], "abc");
-    rb.commitWrite(3);
-    try std.testing.expectEqualSlices(u8, "abc", rb.read());
-
-    rb.consume(2);
-    slice = rb.writeSlice();
-    std.mem.copyForwards(u8, slice[0..3], "def");
-    rb.commitWrite(3);
-    var scratch: [6]u8 = undefined;
-    rb.linearize(&scratch);
-    try std.testing.expectEqualSlices(u8, "cdef", rb.read());
-}
-
-test "ring buffer linearize full wrap" {
-    var storage: [6]u8 = undefined;
-    var rb = RingBuffer.init(&storage);
-
-    _ = rb.write("abcdef");
-    rb.consume(2);
-    _ = rb.write("gh");
-
-    var scratch: [6]u8 = undefined;
-    rb.linearize(&scratch);
-    try std.testing.expectEqualSlices(u8, "cdefgh", rb.read());
+    try std.testing.expect(buf.write("abcd"));
+    try std.testing.expect(!buf.write("efghi"));
 }

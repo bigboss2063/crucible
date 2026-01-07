@@ -35,11 +35,14 @@ pub const StartStatus = enum {
     failed,
 };
 
+pub const CompletionFn = *const fn (ctx: *anyopaque, ok: bool) void;
+
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     cache: *cache_mod.api.Cache,
     default_path: ?[]const u8,
     state: std.atomic.Value(u8),
+    pending_path: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, cache: *cache_mod.api.Cache, default_path: ?[]const u8) Manager {
         return .{
@@ -54,12 +57,24 @@ pub const Manager = struct {
         return self.default_path != null;
     }
 
-    pub fn startSave(self: *Manager, path_override: ?[]const u8, fast: bool) StartStatus {
-        return self.start(.save, path_override, fast);
+    pub fn startSave(
+        self: *Manager,
+        path_override: ?[]const u8,
+        fast: bool,
+        completion_ctx: *anyopaque,
+        completion_fn: CompletionFn,
+    ) StartStatus {
+        return self.start(.save, path_override, fast, completion_ctx, completion_fn);
     }
 
-    pub fn startLoad(self: *Manager, path_override: ?[]const u8, fast: bool) StartStatus {
-        return self.start(.load, path_override, fast);
+    pub fn startLoad(
+        self: *Manager,
+        path_override: ?[]const u8,
+        fast: bool,
+        completion_ctx: *anyopaque,
+        completion_fn: CompletionFn,
+    ) StartStatus {
+        return self.start(.load, path_override, fast, completion_ctx, completion_fn);
     }
 
     pub fn waitForIdle(self: *Manager) void {
@@ -68,7 +83,21 @@ pub const Manager = struct {
         }
     }
 
-    fn start(self: *Manager, kind: TaskKind, path_override: ?[]const u8, fast: bool) StartStatus {
+    pub fn drainPendingPath(self: *Manager) void {
+        if (self.pending_path) |path| {
+            self.allocator.free(path);
+            self.pending_path = null;
+        }
+    }
+
+    fn start(
+        self: *Manager,
+        kind: TaskKind,
+        path_override: ?[]const u8,
+        fast: bool,
+        completion_ctx: *anyopaque,
+        completion_fn: CompletionFn,
+    ) StartStatus {
         if (self.default_path == null) return .disabled;
 
         const path = path_override orelse self.default_path.?;
@@ -81,13 +110,17 @@ pub const Manager = struct {
             return if (current == @intFromEnum(State.saving)) .busy_save else .busy_load;
         }
 
+        self.drainPendingPath();
+
         const path_copy = self.allocator.dupe(u8, path) catch {
             self.state.store(@intFromEnum(State.idle), .release);
             return .failed;
         };
+        self.pending_path = path_copy;
 
         const task = self.allocator.create(BackgroundTask) catch {
             self.allocator.free(path_copy);
+            self.pending_path = null;
             self.state.store(@intFromEnum(State.idle), .release);
             return .failed;
         };
@@ -99,11 +132,14 @@ pub const Manager = struct {
             .kind = kind,
             .path = path_copy,
             .fast = fast,
+            .completion_ctx = completion_ctx,
+            .completion_fn = completion_fn,
         };
 
         const thread = std.Thread.spawn(.{}, backgroundTaskMain, .{task}) catch {
             self.allocator.free(path_copy);
             self.allocator.destroy(task);
+            self.pending_path = null;
             self.state.store(@intFromEnum(State.idle), .release);
             return .failed;
         };
@@ -130,17 +166,28 @@ const BackgroundTask = struct {
     kind: TaskKind,
     path: []u8,
     fast: bool,
+    completion_ctx: *anyopaque,
+    completion_fn: CompletionFn,
 };
 
 fn backgroundTaskMain(task: *BackgroundTask) void {
     defer task.state.store(@intFromEnum(State.idle), .release);
-    defer task.allocator.free(task.path);
     defer task.allocator.destroy(task);
 
+    var ok = true;
     switch (task.kind) {
-        .save => _ = saveSnapshot(task.allocator, task.cache, .{ .path = task.path, .fast = task.fast }) catch {},
-        .load => _ = loadSnapshot(task.allocator, task.cache, .{ .path = task.path, .fast = task.fast }) catch {},
+        .save => {
+            _ = saveSnapshot(task.allocator, task.cache, .{ .path = task.path, .fast = task.fast }) catch {
+                ok = false;
+            };
+        },
+        .load => {
+            _ = loadSnapshot(task.allocator, task.cache, .{ .path = task.path, .fast = task.fast }) catch {
+                ok = false;
+            };
+        },
     }
+    task.completion_fn(task.completion_ctx, ok);
 }
 
 const default_block_size: usize = 1024 * 1024;
