@@ -139,6 +139,14 @@ Example CLI usage:
 ./zig-out/bin/crucible --listen 127.0.0.1:6379 --protocol resp --threads 4
 ```
 
+Optional unix socket listener (in addition to TCP):
+
+```sh
+./zig-out/bin/crucible -s /tmp/crucible.sock
+```
+
+The unix socket path is unlinked on startup and is not removed on shutdown.
+
 Resource control flags:
 
 ```sh
@@ -167,7 +175,8 @@ pub fn main() !void {
         .cache = cache,
         .address = try std.net.Address.parseIp("127.0.0.1", 8080),
         .protocol = .auto,
-        .buffer_size = 4096,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
     });
     defer server.deinit();
 

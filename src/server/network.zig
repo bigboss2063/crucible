@@ -24,6 +24,7 @@ pub const ServerOptions = struct {
     allocator: std.mem.Allocator,
     cache: *cache.api.Cache,
     persist_path: ?[]const u8 = null,
+    unix_path: ?[]const u8 = null,
     address: std.net.Address,
     protocol: Protocol = .auto,
     max_connections: usize = 10_000,
@@ -224,7 +225,8 @@ fn onMetricsFlush(
     return .disarm;
 }
 
-fn configureSocket(tcp: xev.TCP) bool {
+fn configureSocket(tcp: xev.TCP, is_unix: bool) bool {
+    if (is_unix) return true;
     if (builtin.os.tag != .linux) return true;
     const fd = tcp.fd();
     const yes: c_int = 1;
@@ -235,7 +237,8 @@ fn configureSocket(tcp: xev.TCP) bool {
     return true;
 }
 
-fn configureListener(tcp: xev.TCP) bool {
+fn configureListener(tcp: xev.TCP, is_unix: bool) bool {
+    if (is_unix) return true;
     if (builtin.os.tag != .linux) return true;
     const fd = tcp.fd();
     const yes: c_int = 1;
@@ -330,6 +333,8 @@ pub const Server = struct {
     loop: xev.Loop,
     listener: xev.TCP,
     accept_completion: xev.Completion = .{},
+    unix_listener: ?xev.TCP = null,
+    unix_accept_completion: xev.Completion = .{},
     shutdown_async: xev.Async,
     shutdown_completion: xev.Completion = .{},
     persist_queue: PersistQueue,
@@ -358,6 +363,7 @@ pub const Server = struct {
         if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
         if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
         if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
+        if (opts.unix_path != null and !std.net.has_unix_sockets) return error.UnixSocketUnsupported;
         const limits = Limits{
             .max_key_length = opts.max_request_bytes,
             .max_value_length = opts.max_request_bytes,
@@ -386,9 +392,21 @@ pub const Server = struct {
 
         var listener = try xev.TCP.init(opts.address);
         errdefer closeTcpImmediate(listener);
-        if (!configureListener(listener)) return error.SocketOptionFailed;
+        if (!configureListener(listener, false)) return error.SocketOptionFailed;
         try listener.bind(opts.address);
         try listener.listen(opts.backlog);
+
+        var unix_listener: ?xev.TCP = null;
+        if (opts.unix_path) |path| {
+            const unix_addr = try std.net.Address.initUnix(path);
+            std.posix.unlink(path) catch {};
+            var unix_tcp = try xev.TCP.init(unix_addr);
+            errdefer closeTcpImmediate(unix_tcp);
+            if (!configureListener(unix_tcp, true)) return error.SocketOptionFailed;
+            try unix_tcp.bind(unix_addr);
+            try unix_tcp.listen(opts.backlog);
+            unix_listener = unix_tcp;
+        }
 
         const bound_address = try getBoundAddress(listener);
         var pool = try connection.ConnectionPool.init(
@@ -409,6 +427,7 @@ pub const Server = struct {
             .limits = limits,
             .loop = loop,
             .listener = listener,
+            .unix_listener = unix_listener,
             .pool = pool,
             .metrics = metrics,
             .owns_metrics = true,
@@ -428,6 +447,9 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.resource_controls.stop();
         closeTcpImmediate(self.listener);
+        if (self.unix_listener) |listener| {
+            closeTcpImmediate(listener);
+        }
         self.persistence.waitForIdle();
         self.persistence.drainPendingPath();
         self.pool.deinit();
@@ -484,7 +506,18 @@ pub const Server = struct {
     }
 
     fn queueAccept(self: *Server) void {
-        self.listener.accept(&self.loop, &self.accept_completion, Server, self, onAccept);
+        self.queueAcceptTcp();
+        self.queueAcceptUnix();
+    }
+
+    fn queueAcceptTcp(self: *Server) void {
+        self.listener.accept(&self.loop, &self.accept_completion, Server, self, onAcceptTcp);
+    }
+
+    fn queueAcceptUnix(self: *Server) void {
+        if (self.unix_listener) |listener| {
+            listener.accept(&self.loop, &self.unix_accept_completion, Server, self, onAcceptUnix);
+        }
     }
 };
 
@@ -531,22 +564,13 @@ fn drainPersistQueue(ctx: *ServerContext) void {
     }
 }
 
-fn onAccept(
-    ud: ?*Server,
-    loop: *xev.Loop,
-    _: *xev.Completion,
-    result: xev.AcceptError!xev.TCP,
-) xev.CallbackAction {
-    const server = ud.?;
-    _ = loop;
-
+fn handleAccept(server: *Server, result: xev.AcceptError!xev.TCP, is_unix: bool) void {
     if (result) |tcp| {
         addU64(&server.metrics.total_connections, 1);
-        if (!configureSocket(tcp)) {
+        if (!configureSocket(tcp, is_unix)) {
             addU64(&server.metrics.errors.accept, 1);
             closeTcpImmediate(tcp);
-            server.queueAccept();
-            return .disarm;
+            return;
         }
         if (server.pool.acquire(tcp)) |conn| {
             conn.server = &server.context;
@@ -560,8 +584,31 @@ fn onAccept(
     } else |_| {
         addU64(&server.metrics.errors.accept, 1);
     }
+}
 
-    server.queueAccept();
+fn onAcceptTcp(
+    ud: ?*Server,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+    handleAccept(server, result, false);
+    server.queueAcceptTcp();
+    return .disarm;
+}
+
+fn onAcceptUnix(
+    ud: ?*Server,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+    handleAccept(server, result, true);
+    server.queueAcceptUnix();
     return .disarm;
 }
 
@@ -1478,6 +1525,8 @@ pub const ThreadedServer = struct {
     loop: xev.Loop,
     listener: xev.TCP,
     accept_completion: xev.Completion = .{},
+    unix_listener: ?xev.TCP = null,
+    unix_accept_completion: xev.Completion = .{},
     shutdown_async: xev.Async,
     shutdown_completion: xev.Completion = .{},
     workers: []Worker,
@@ -1491,6 +1540,7 @@ pub const ThreadedServer = struct {
         if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
         if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
         if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
+        if (opts.unix_path != null and !std.net.has_unix_sockets) return error.UnixSocketUnsupported;
         const limits = Limits{
             .max_key_length = opts.max_request_bytes,
             .max_value_length = opts.max_request_bytes,
@@ -1522,9 +1572,21 @@ pub const ThreadedServer = struct {
 
         var listener = try xev.TCP.init(opts.address);
         errdefer closeTcpImmediate(listener);
-        if (!configureListener(listener)) return error.SocketOptionFailed;
+        if (!configureListener(listener, false)) return error.SocketOptionFailed;
         try listener.bind(opts.address);
         try listener.listen(opts.backlog);
+
+        var unix_listener: ?xev.TCP = null;
+        if (opts.unix_path) |path| {
+            const unix_addr = try std.net.Address.initUnix(path);
+            std.posix.unlink(path) catch {};
+            var unix_tcp = try xev.TCP.init(unix_addr);
+            errdefer closeTcpImmediate(unix_tcp);
+            if (!configureListener(unix_tcp, true)) return error.SocketOptionFailed;
+            try unix_tcp.bind(unix_addr);
+            try unix_tcp.listen(opts.backlog);
+            unix_listener = unix_tcp;
+        }
 
         const bound_address = try getBoundAddress(listener);
 
@@ -1591,6 +1653,7 @@ pub const ThreadedServer = struct {
             .persistence = persistence_mgr,
             .loop = loop,
             .listener = listener,
+            .unix_listener = unix_listener,
             .workers = workers,
             .metrics_context = metrics_context,
             .next_worker = AtomicUsize.init(0),
@@ -1613,6 +1676,9 @@ pub const ThreadedServer = struct {
         self.allocator.destroy(self.metrics_context);
         self.resource_controls.stop();
         closeTcpImmediate(self.listener);
+        if (self.unix_listener) |listener| {
+            closeTcpImmediate(listener);
+        }
         self.shutdown_async.deinit();
         self.loop.deinit();
         self.allocator.destroy(self.persistence);
@@ -1650,7 +1716,18 @@ pub const ThreadedServer = struct {
     }
 
     fn queueAccept(self: *ThreadedServer) void {
-        self.listener.accept(&self.loop, &self.accept_completion, ThreadedServer, self, onThreadedAccept);
+        self.queueAcceptTcp();
+        self.queueAcceptUnix();
+    }
+
+    fn queueAcceptTcp(self: *ThreadedServer) void {
+        self.listener.accept(&self.loop, &self.accept_completion, ThreadedServer, self, onThreadedAcceptTcp);
+    }
+
+    fn queueAcceptUnix(self: *ThreadedServer) void {
+        if (self.unix_listener) |listener| {
+            listener.accept(&self.loop, &self.unix_accept_completion, ThreadedServer, self, onThreadedAcceptUnix);
+        }
     }
 
     fn dispatch(self: *ThreadedServer, fd: std.posix.fd_t) bool {
@@ -1677,22 +1754,13 @@ fn onThreadedShutdownAsync(
     return .disarm;
 }
 
-fn onThreadedAccept(
-    ud: ?*ThreadedServer,
-    loop: *xev.Loop,
-    _: *xev.Completion,
-    result: xev.AcceptError!xev.TCP,
-) xev.CallbackAction {
-    const server = ud.?;
-    _ = loop;
-
+fn handleThreadedAccept(server: *ThreadedServer, result: xev.AcceptError!xev.TCP, is_unix: bool) void {
     if (result) |tcp| {
         addU64(&server.metrics.total_connections, 1);
-        if (!configureSocket(tcp)) {
+        if (!configureSocket(tcp, is_unix)) {
             addU64(&server.metrics.errors.accept, 1);
             closeTcpImmediate(tcp);
-            server.queueAccept();
-            return .disarm;
+            return;
         }
         const active = server.metrics.active_connections.fetchAdd(1, .monotonic) + 1;
         if (active > server.options.max_connections) {
@@ -1707,8 +1775,31 @@ fn onThreadedAccept(
     } else |_| {
         addU64(&server.metrics.errors.accept, 1);
     }
+}
 
-    server.queueAccept();
+fn onThreadedAcceptTcp(
+    ud: ?*ThreadedServer,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+    handleThreadedAccept(server, result, false);
+    server.queueAcceptTcp();
+    return .disarm;
+}
+
+fn onThreadedAcceptUnix(
+    ud: ?*ThreadedServer,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.AcceptError!xev.TCP,
+) xev.CallbackAction {
+    const server = ud.?;
+    _ = loop;
+    handleThreadedAccept(server, result, true);
+    server.queueAcceptUnix();
     return .disarm;
 }
 
@@ -1784,6 +1875,18 @@ fn connectRetry(addr: std.net.Address) !std.net.Stream {
     return error.ConnectionRefused;
 }
 
+fn connectUnixRetry(path: []const u8) !std.net.Stream {
+    var attempt: usize = 0;
+    while (attempt < 10) : (attempt += 1) {
+        if (std.net.connectUnixSocket(path)) |stream| {
+            return stream;
+        } else |_| {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    return error.ConnectionRefused;
+}
+
 fn readHttpResponse(stream: *std.net.Stream, buf: []u8) ![]const u8 {
     var used: usize = 0;
     while (used < buf.len) {
@@ -1850,6 +1953,55 @@ test "server accepts HTTP connections" {
     var buf: [256]u8 = undefined;
     const res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "404") != null);
+}
+
+test "unix socket accepts RESP connections" {
+    if (!std.net.has_unix_sockets) return;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const socket_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "crucible.sock",
+    });
+    defer allocator.free(socket_path);
+    std.posix.unlink(socket_path) catch {};
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .unix_path = socket_path,
+        .read_buffer_bytes = 4096,
+        .write_buffer_bytes = 4096,
+    });
+    defer harness.stop();
+    defer std.posix.unlink(socket_path) catch {};
+
+    var stream = try connectUnixRetry(socket_path);
+    defer stream.close();
+
+    try stream.writer().writeAll("*1\r\n$4\r\nPING\r\n");
+    var buf: [64]u8 = undefined;
+    var used: usize = 0;
+    var attempt: usize = 0;
+    while (attempt < 5 and used < buf.len) : (attempt += 1) {
+        const n = try stream.reader().read(buf[used..]);
+        if (n == 0) break;
+        used += n;
+        if (std.mem.indexOf(u8, buf[0..used], "+PONG\r\n") != null) break;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..used], "+PONG\r\n") != null);
 }
 
 test "http end-to-end commands with keepalive" {

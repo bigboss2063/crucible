@@ -64,6 +64,7 @@ const CliOptions = struct {
     evict: bool,
     autosweep: bool,
     persist_path: ?[]const u8,
+    unix_path: ?[]const u8,
     show_help: bool,
 };
 
@@ -95,6 +96,7 @@ fn defaultOptions(sysmem: u64) ParseError!CliOptions {
         .evict = true,
         .autosweep = true,
         .persist_path = null,
+        .unix_path = null,
         .show_help = false,
     };
 }
@@ -221,6 +223,10 @@ fn parseArgs(args: []const []const u8) ParseError!CliOptions {
         } else if (std.mem.eql(u8, arg, "--listen")) {
             const value = try nextValue(args, &i);
             listen_override = try parseListen(value);
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--unixsocket")) {
+            const value = try nextValue(args, &i);
+            if (value.len == 0) return error.InvalidArgs;
+            opts.unix_path = value;
         } else if (std.mem.eql(u8, arg, "--protocol")) {
             const value = try nextValue(args, &i);
             if (std.ascii.eqlIgnoreCase(value, "auto")) {
@@ -317,6 +323,7 @@ fn printUsage(file: std.fs.File) !void {
         \\  -h host                 listening host                (default: 0.0.0.0)
         \\  -p port                 listening port                (default: 6379)
         \\  --listen addr           listen address host:port or [ipv6]:port
+        \\  -s, --unixsocket path   unix socket listener         (default: none)
         \\  --protocol auto|http|resp                          (default: auto)
         \\
         \\Performance options:
@@ -403,6 +410,7 @@ pub fn main() !void {
         .keepalive_timeout_ns = opts.keepalive_ms * std.time.ns_per_ms,
         .backlog = opts.backlog,
         .loop_entries = opts.loop_entries,
+        .unix_path = opts.unix_path,
         .maxmemory_bytes = opts.maxmemory_bytes,
         .evict = opts.evict,
         .autosweep = opts.autosweep,
@@ -464,6 +472,7 @@ test "parse args defaults" {
     try std.testing.expectEqual(@as(usize, 16 * 1024), opts.write_buffer_bytes);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), opts.max_request_bytes);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), opts.max_response_bytes);
+    try std.testing.expect(opts.unix_path == null);
     const sysmem = try systemMemoryBytes();
     const expected_max = @as(u64, @intFromFloat(@as(f64, @floatFromInt(sysmem)) * 0.8));
     try std.testing.expectEqual(@as(?u64, expected_max), opts.maxmemory_bytes);
@@ -479,6 +488,15 @@ test "parse args listen and protocol" {
     const expected = try std.net.Address.parseIp("127.0.0.1", 6380);
     try std.testing.expect(std.net.Address.eql(expected, opts.address));
     try std.testing.expectEqual(crucible.server.network.Protocol.resp, opts.protocol);
+}
+
+test "parse args unixsocket" {
+    const opts = try parseArgs(&[_][]const u8{
+        "-s",
+        "crucible.sock",
+    });
+    try std.testing.expect(opts.unix_path != null);
+    try std.testing.expectEqualStrings("crucible.sock", opts.unix_path.?);
 }
 
 test "parse args cache options" {
