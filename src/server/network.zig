@@ -2035,6 +2035,90 @@ test "resp end-to-end and pipeline" {
     try std.testing.expect(std.mem.count(u8, out, "$1\r\n1\r\n") == 2);
 }
 
+test "resp pipeline spans small read buffers" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .read_buffer_bytes = 4,
+        .write_buffer_bytes = 64,
+        .max_request_bytes = 128,
+        .max_response_bytes = 128,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    const value = "0123456789abcdefghij";
+    try stream.writer().writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$20\r\n");
+    try stream.writer().writeAll(value);
+    try stream.writer().writeAll("\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+
+    var buf: [512]u8 = undefined;
+    var used: usize = 0;
+    var ok_found = false;
+    var value_count: usize = 0;
+    var reads: usize = 0;
+    while (reads < 5 and used < buf.len and (!ok_found or value_count < 2)) : (reads += 1) {
+        const n = try stream.reader().read(buf[used..]);
+        if (n == 0) break;
+        used += n;
+        const out = buf[0..used];
+        ok_found = std.mem.indexOf(u8, out, "+OK\r\n") != null;
+        value_count = std.mem.count(u8, out, value);
+    }
+
+    try std.testing.expect(ok_found);
+    try std.testing.expectEqual(@as(usize, 2), value_count);
+}
+
+test "resp response overflow increments buffer_overflow" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    var value_buf: [64]u8 = undefined;
+    for (value_buf[0..]) |*b| b.* = 'a';
+    _ = try cache.engine.store(cache_instance, "k", value_buf[0..], .{});
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .read_buffer_bytes = 16,
+        .write_buffer_bytes = 16,
+        .max_request_bytes = 64,
+        .max_response_bytes = 64,
+    });
+    defer harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+
+    var metrics = harness.server.metricsSnapshot();
+    var attempt: usize = 0;
+    while (attempt < 50 and metrics.errors.buffer_overflow == 0) : (attempt += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+        metrics = harness.server.metricsSnapshot();
+    }
+    try std.testing.expect(metrics.errors.buffer_overflow >= 1);
+}
+
 test "resp ops commands return pong and stats" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
