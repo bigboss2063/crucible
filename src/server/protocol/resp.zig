@@ -52,11 +52,14 @@ pub const Command = union(enum) {
     ping: void,
     info: void,
     stats: void,
+    monitor: void,
 };
 
 pub const ParsedCommand = struct {
     command: Command,
     consumed: usize,
+    args: [MaxArgs][]const u8,
+    args_len: usize,
 };
 
 pub const ParseResult = union(enum) {
@@ -137,13 +140,23 @@ pub fn parse(state: *State, buf: []const u8, limits: Limits, eof: bool) ParseRes
             },
             .bulk_len => {
                 if (state.arg_index >= state.array_len) {
-                    const cmd = buildCommand(state, buf, limits) catch |err| {
+                    var args_buf: [MaxArgs][]const u8 = undefined;
+                    const args_len = collectArgs(state, buf, &args_buf) catch |err| {
+                        state.* = initState();
+                        return .{ .err = err };
+                    };
+                    const cmd = buildCommand(args_buf[0..args_len], limits) catch |err| {
                         state.* = initState();
                         return .{ .err = err };
                     };
                     const consumed = pos;
                     state.* = initState();
-                    return .{ .ok = .{ .command = cmd, .consumed = consumed } };
+                    return .{ .ok = .{
+                        .command = cmd,
+                        .consumed = consumed,
+                        .args = args_buf,
+                        .args_len = args_len,
+                    } };
                 }
                 if (pos >= buf.len) {
                     state.offset = pos;
@@ -202,18 +215,20 @@ fn parseNumber(slice: []const u8) Error!i64 {
     return std.fmt.parseInt(i64, slice, 10) catch Error.InvalidNumber;
 }
 
-fn buildCommand(state: *const State, buf: []const u8, limits: Limits) Error!Command {
+fn collectArgs(state: *const State, buf: []const u8, out: *[MaxArgs][]const u8) Error!usize {
     if (state.array_len == 0) return Error.MalformedRequest;
-    var args_buf: [MaxArgs][]const u8 = undefined;
     var idx: usize = 0;
     while (idx < state.array_len) : (idx += 1) {
         const arg = state.args[idx];
         if (arg.start > buf.len) return Error.MalformedRequest;
         const remaining = buf.len - arg.start;
         if (arg.len > remaining) return Error.MalformedRequest;
-        args_buf[idx] = buf[arg.start .. arg.start + arg.len];
+        out[idx] = buf[arg.start .. arg.start + arg.len];
     }
-    const args = args_buf[0..state.array_len];
+    return state.array_len;
+}
+
+fn buildCommand(args: []const []const u8, limits: Limits) Error!Command {
     const cmd = args[0];
     if (std.ascii.eqlIgnoreCase(cmd, "PING")) {
         if (args.len != 1) return Error.MalformedRequest;
@@ -226,6 +241,10 @@ fn buildCommand(state: *const State, buf: []const u8, limits: Limits) Error!Comm
     if (std.ascii.eqlIgnoreCase(cmd, "STATS")) {
         if (args.len != 1) return Error.MalformedRequest;
         return .{ .stats = {} };
+    }
+    if (std.ascii.eqlIgnoreCase(cmd, "MONITOR")) {
+        if (args.len != 1) return Error.MalformedRequest;
+        return .{ .monitor = {} };
     }
     if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
         if (args.len != 2) return Error.MalformedRequest;
@@ -383,6 +402,14 @@ test "resp parser handles STATS command" {
     const res = parser.parse(buf, false);
     try std.testing.expect(res == .ok);
     try std.testing.expect(res.ok.command == .stats);
+}
+
+test "resp parser handles MONITOR command" {
+    var parser = Parser.init(.{});
+    const buf = "*1\r\n$7\r\nMONITOR\r\n";
+    const res = parser.parse(buf, false);
+    try std.testing.expect(res == .ok);
+    try std.testing.expect(res.ok.command == .monitor);
 }
 
 test "resp parser supports pipeline" {

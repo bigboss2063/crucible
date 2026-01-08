@@ -67,6 +67,7 @@ const MetricsSnapshotFn = *const fn (*const anyopaque) Metrics;
 
 const AtomicU64 = std.atomic.Value(u64);
 const AtomicUsize = std.atomic.Value(usize);
+const AtomicBool = std.atomic.Value(bool);
 
 pub const AtomicErrorCounts = struct {
     accept: AtomicU64,
@@ -183,6 +184,72 @@ fn addMetrics(dst: *Metrics, src: Metrics) void {
 
 const MetricsBatch = connection.MetricsBatch;
 
+const MonitorEvent = struct {
+    payload: []u8,
+};
+
+const MonitorQueue = struct {
+    events: []MonitorEvent,
+    head: usize = 0,
+    tail: usize = 0,
+    len: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !MonitorQueue {
+        const cap = if (capacity == 0) 1 else capacity;
+        const events = try allocator.alloc(MonitorEvent, cap);
+        return .{ .events = events };
+    }
+
+    pub fn deinit(self: *MonitorQueue, allocator: std.mem.Allocator) void {
+        allocator.free(self.events);
+    }
+
+    pub fn push(self: *MonitorQueue, event: MonitorEvent) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.len == self.events.len) return false;
+        self.events[self.tail] = event;
+        self.tail = (self.tail + 1) % self.events.len;
+        self.len += 1;
+        return true;
+    }
+
+    pub fn pop(self: *MonitorQueue) ?MonitorEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.len == 0) return null;
+        const event = self.events[self.head];
+        self.head = (self.head + 1) % self.events.len;
+        self.len -= 1;
+        if (self.len == 0) {
+            self.head = 0;
+            self.tail = 0;
+        }
+        return event;
+    }
+};
+
+const MonitorRegistry = struct {
+    conns: std.ArrayListUnmanaged(*connection.Connection) = .{},
+
+    pub fn deinit(self: *MonitorRegistry, allocator: std.mem.Allocator) void {
+        self.conns.deinit(allocator);
+    }
+};
+
+const MonitorTarget = struct {
+    queue: *MonitorQueue,
+    overflow: *AtomicBool,
+    async: *xev.Async,
+};
+
+const MonitorHub = struct {
+    allocator: std.mem.Allocator,
+    total: AtomicUsize,
+    targets: []MonitorTarget,
+};
+
 const metrics_flush_interval_ms: u64 = 50;
 
 fn flushMetricsBatch(ctx: *ServerContext) void {
@@ -202,6 +269,182 @@ fn recordRequest(conn: *connection.Connection) void {
 
 fn recordResponse(conn: *connection.Connection) void {
     conn.pending_metrics.recordResponse();
+}
+
+fn setClientAddr(conn: *connection.Connection, value: []const u8) void {
+    const len = @min(value.len, conn.client_addr_buf.len);
+    std.mem.copyForwards(u8, conn.client_addr_buf[0..len], value[0..len]);
+    conn.client_addr_len = len;
+}
+
+fn initClientAddr(conn: *connection.Connection, tcp: xev.TCP, is_unix: bool) void {
+    if (is_unix) {
+        setClientAddr(conn, "unix");
+        return;
+    }
+    var addr_storage: std.posix.sockaddr.storage = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(tcp.fd(), @ptrCast(&addr_storage), &addr_len) catch {
+        setClientAddr(conn, "unknown");
+        return;
+    };
+    const addr = std.net.Address.initPosix(@ptrCast(&addr_storage));
+    const rendered = std.fmt.bufPrint(&conn.client_addr_buf, "{f}", .{addr}) catch {
+        setClientAddr(conn, "unknown");
+        return;
+    };
+    conn.client_addr_len = rendered.len;
+}
+
+fn monitorRegister(conn: *connection.Connection, ctx: *ServerContext) bool {
+    if (conn.monitoring) return true;
+    ctx.monitor_registry.conns.append(ctx.options.allocator, conn) catch return false;
+    conn.monitoring = true;
+    if (ctx.monitor_hub) |hub| {
+        _ = hub.total.fetchAdd(1, .monotonic);
+    }
+    return true;
+}
+
+fn monitorUnregister(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (!conn.monitoring) return;
+    conn.monitoring = false;
+    var idx: usize = 0;
+    const items = ctx.monitor_registry.conns.items;
+    while (idx < items.len) : (idx += 1) {
+        if (items[idx] == conn) {
+            const last = items.len - 1;
+            ctx.monitor_registry.conns.items[idx] = ctx.monitor_registry.conns.items[last];
+            ctx.monitor_registry.conns.items.len = last;
+            break;
+        }
+    }
+    if (ctx.monitor_hub) |hub| {
+        _ = hub.total.fetchSub(1, .monotonic);
+    }
+}
+
+fn monitorEmit(ctx: *ServerContext, origin: *connection.Connection, args: []const []const u8) void {
+    if (args.len == 0) return;
+    if (ctx.monitor_hub) |hub| {
+        if (hub.total.load(.monotonic) == 0) return;
+    } else if (ctx.monitor_registry.conns.items.len == 0) {
+        return;
+    }
+
+    const allocator = ctx.options.allocator;
+    const line = formatMonitorLine(allocator, origin.clientAddr(), args) catch return;
+    defer allocator.free(line);
+
+    if (ctx.monitor_hub) |hub| {
+        for (hub.targets) |target| {
+            const payload = allocator.alloc(u8, line.len) catch {
+                target.overflow.store(true, .monotonic);
+                target.async.notify() catch {};
+                continue;
+            };
+            std.mem.copyForwards(u8, payload, line);
+            if (!target.queue.push(.{ .payload = payload })) {
+                allocator.free(payload);
+                target.overflow.store(true, .monotonic);
+            }
+            target.async.notify() catch {};
+        }
+    } else {
+        deliverMonitorLine(ctx, line);
+    }
+}
+
+fn closeAllMonitors(ctx: *ServerContext) void {
+    while (ctx.monitor_registry.conns.items.len != 0) {
+        const idx = ctx.monitor_registry.conns.items.len - 1;
+        const conn = ctx.monitor_registry.conns.items[idx];
+        closeConnection(conn, ctx);
+    }
+}
+
+fn clearMonitorQueue(queue: *MonitorQueue, allocator: std.mem.Allocator) void {
+    while (queue.pop()) |event| {
+        allocator.free(event.payload);
+    }
+}
+
+fn drainMonitorQueue(ctx: *ServerContext) void {
+    const queue = ctx.monitor_queue orelse return;
+    if (ctx.monitor_overflow) |overflow| {
+        if (overflow.swap(false, .acq_rel)) {
+            closeAllMonitors(ctx);
+            clearMonitorQueue(queue, ctx.options.allocator);
+        }
+    }
+    while (queue.pop()) |event| {
+        deliverMonitorLine(ctx, event.payload);
+        ctx.options.allocator.free(event.payload);
+    }
+}
+
+fn deliverMonitorLine(ctx: *ServerContext, line: []const u8) void {
+    var idx: usize = 0;
+    while (idx < ctx.monitor_registry.conns.items.len) {
+        const conn = ctx.monitor_registry.conns.items[idx];
+        if (conn.in_pool or conn.close_done or conn.close_queued or conn.closing) {
+            monitorUnregister(conn, ctx);
+            continue;
+        }
+        const out = selectWriteBuffer(conn);
+        if (!writeAll(out, true, line)) {
+            closeConnection(conn, ctx);
+            continue;
+        }
+        queueWrite(conn, ctx);
+        idx += 1;
+    }
+}
+
+fn formatMonitorLine(
+    allocator: std.mem.Allocator,
+    client_addr: []const u8,
+    args: []const []const u8,
+) ![]u8 {
+    var list = std.ArrayList(u8).empty;
+    errdefer list.deinit(allocator);
+    const ts_us = std.time.microTimestamp();
+    const secs = @divFloor(ts_us, 1_000_000);
+    const micros: u32 = @intCast(@mod(ts_us, 1_000_000));
+    try list.print(allocator, "+{d}.{d:0>6} [0 {s}]", .{ secs, micros, client_addr });
+    for (args) |arg| {
+        try appendEscapedArg(&list, allocator, arg);
+    }
+    try list.appendSlice(allocator, "\r\n");
+    return list.toOwnedSlice(allocator);
+}
+
+fn appendEscapedArg(list: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    try list.appendSlice(allocator, " \"");
+    for (arg) |ch| {
+        switch (ch) {
+            '\n' => try list.appendSlice(allocator, "\\n"),
+            '\r' => try list.appendSlice(allocator, "\\r"),
+            '\t' => try list.appendSlice(allocator, "\\t"),
+            '"' => try list.appendSlice(allocator, "\\\""),
+            '\\' => try list.appendSlice(allocator, "\\\\"),
+            else => {
+                if (ch < 32 or ch >= 127) {
+                    try appendHexByte(list, allocator, ch);
+                } else {
+                    try list.append(allocator, ch);
+                }
+            },
+        }
+    }
+    try list.append(allocator, '"');
+}
+
+fn appendHexByte(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u8) !void {
+    const hex = "0123456789ABCDEF";
+    try list.appendSlice(allocator, "\\x");
+    try list.append(allocator, hex[value >> 4]);
+    try list.append(allocator, hex[value & 0xF]);
 }
 
 fn startMetricsFlush(ctx: *ServerContext) void {
@@ -323,6 +566,10 @@ const ServerContext = struct {
     metrics_batch: *MetricsBatch,
     metrics_timer: *xev.Timer,
     metrics_timer_completion: *xev.Completion,
+    monitor_registry: *MonitorRegistry,
+    monitor_queue: ?*MonitorQueue,
+    monitor_overflow: ?*AtomicBool,
+    monitor_hub: ?*MonitorHub,
 };
 
 pub const Server = struct {
@@ -346,6 +593,7 @@ pub const Server = struct {
     metrics_batch: MetricsBatch,
     metrics_timer: xev.Timer,
     metrics_timer_completion: xev.Completion = .{},
+    monitor_registry: MonitorRegistry,
     start_time_ms: u64,
     persistence: *persistence.Manager,
     context: ServerContext,
@@ -428,6 +676,7 @@ pub const Server = struct {
             .owns_metrics = true,
             .metrics_batch = .{},
             .metrics_timer = metrics_timer,
+            .monitor_registry = .{},
             .start_time_ms = start_time_ms,
             .persistence = persistence_mgr,
             .context = undefined,
@@ -448,6 +697,7 @@ pub const Server = struct {
         self.persistence.waitForIdle();
         self.persistence.drainPendingPath();
         self.pool.deinit();
+        self.monitor_registry.deinit(self.allocator);
         self.shutdown_async.deinit();
         self.persist_async.deinit();
         self.persist_queue.deinit();
@@ -477,6 +727,10 @@ pub const Server = struct {
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
             .metrics_timer_completion = &self.metrics_timer_completion,
+            .monitor_registry = &self.monitor_registry,
+            .monitor_queue = null,
+            .monitor_overflow = null,
+            .monitor_hub = null,
         };
         try self.resource_controls.start(self.cache);
         startMetricsFlush(&self.context);
@@ -569,6 +823,7 @@ fn handleAccept(server: *Server, result: xev.AcceptError!xev.TCP, is_unix: bool)
         }
         if (server.pool.acquire(tcp)) |conn| {
             conn.server = &server.context;
+            initClientAddr(conn, tcp, is_unix);
             addUsize(&server.metrics.active_connections, 1);
             startKeepalive(conn, &server.context);
             queueRead(conn, &server.context);
@@ -730,6 +985,10 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
                         conn.read_needs_more = false;
                         conn.read_buf.consume(parsed.consumed);
                         recordRequest(conn);
+                        const emit = parsed.command != .monitor and (!conn.monitoring or parsed.command == .ping);
+                        if (emit) {
+                            monitorEmit(ctx, conn, parsed.args[0..parsed.args_len]);
+                        }
                         handleRespCommand(conn, ctx, parsed.command);
                         if (conn.persist_state != .idle) return;
                         if (conn.closing) return;
@@ -803,6 +1062,49 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
 }
 
 fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: resp.Command) void {
+    if (conn.monitoring) {
+        switch (cmd) {
+            .ping => {
+                const out = selectWriteBuffer(conn);
+                if (!writeRespSimple(out, true, "PONG")) {
+                    addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                    closeConnection(conn, ctx);
+                    return;
+                }
+                recordResponse(conn);
+                queueWrite(conn, ctx);
+            },
+            else => {
+                closeConnection(conn, ctx);
+            },
+        }
+        return;
+    }
+
+    if (cmd == .monitor) {
+        if (!monitorRegister(conn, ctx)) {
+            const out = selectWriteBuffer(conn);
+            if (!writeRespError(out, true, "ERR monitor unavailable")) {
+                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                closeConnection(conn, ctx);
+                return;
+            }
+            recordResponse(conn);
+            queueWrite(conn, ctx);
+            return;
+        }
+        const out = selectWriteBuffer(conn);
+        if (!writeRespSimple(out, true, "OK")) {
+            monitorUnregister(conn, ctx);
+            addU64(&ctx.metrics.errors.buffer_overflow, 1);
+            closeConnection(conn, ctx);
+            return;
+        }
+        recordResponse(conn);
+        queueWrite(conn, ctx);
+        return;
+    }
+
     switch (cmd) {
         .save => |save_cmd| {
             _ = handlePersistCommand(conn, ctx, true, save_cmd.path, save_cmd.fast);
@@ -1074,6 +1376,7 @@ fn maybeRelease(conn: *connection.Connection, ctx: *ServerContext) void {
 fn closeConnection(conn: *connection.Connection, ctx: *ServerContext) void {
     if (conn.in_pool or conn.close_done) return;
     if (conn.close_queued) return;
+    monitorUnregister(conn, ctx);
     if (conn.write_in_progress) {
         conn.closing = true;
         cancelKeepalive(conn, ctx);
@@ -1308,8 +1611,13 @@ fn getBoundAddress(listener: xev.TCP) !std.net.Address {
     return std.net.Address.initPosix(&addr);
 }
 
+const AcceptToken = struct {
+    fd: std.posix.fd_t,
+    is_unix: bool,
+};
+
 const WorkerQueue = struct {
-    fds: []std.posix.fd_t,
+    tokens: []AcceptToken,
     head: usize = 0,
     tail: usize = 0,
     len: usize = 0,
@@ -1317,36 +1625,36 @@ const WorkerQueue = struct {
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !WorkerQueue {
         const cap = if (capacity == 0) 1 else capacity;
-        const fds = try allocator.alloc(std.posix.fd_t, cap);
-        return .{ .fds = fds };
+        const tokens = try allocator.alloc(AcceptToken, cap);
+        return .{ .tokens = tokens };
     }
 
     pub fn deinit(self: *WorkerQueue, allocator: std.mem.Allocator) void {
-        allocator.free(self.fds);
+        allocator.free(self.tokens);
     }
 
-    pub fn push(self: *WorkerQueue, fd: std.posix.fd_t) bool {
+    pub fn push(self: *WorkerQueue, token: AcceptToken) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.len == self.fds.len) return false;
-        self.fds[self.tail] = fd;
-        self.tail = (self.tail + 1) % self.fds.len;
+        if (self.len == self.tokens.len) return false;
+        self.tokens[self.tail] = token;
+        self.tail = (self.tail + 1) % self.tokens.len;
         self.len += 1;
         return true;
     }
 
-    pub fn pop(self: *WorkerQueue) ?std.posix.fd_t {
+    pub fn pop(self: *WorkerQueue) ?AcceptToken {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.len == 0) return null;
-        const fd = self.fds[self.head];
-        self.head = (self.head + 1) % self.fds.len;
+        const token = self.tokens[self.head];
+        self.head = (self.head + 1) % self.tokens.len;
         self.len -= 1;
         if (self.len == 0) {
             self.head = 0;
             self.tail = 0;
         }
-        return fd;
+        return token;
     }
 };
 
@@ -1357,6 +1665,9 @@ const Worker = struct {
     pool: connection.ConnectionPool,
     queue: WorkerQueue,
     persist_queue: PersistQueue,
+    monitor_registry: MonitorRegistry,
+    monitor_queue: MonitorQueue,
+    monitor_overflow: AtomicBool,
     async: xev.Async,
     async_completion: xev.Completion = .{},
     thread: ?std.Thread = null,
@@ -1402,6 +1713,9 @@ const Worker = struct {
         var queue = try WorkerQueue.init(allocator, queue_capacity);
         errdefer queue.deinit(allocator);
 
+        var monitor_queue = try MonitorQueue.init(allocator, queue_capacity);
+        errdefer monitor_queue.deinit(allocator);
+
         const async = try xev.Async.init();
         errdefer async.deinit();
 
@@ -1414,6 +1728,9 @@ const Worker = struct {
             .pool = pool,
             .queue = queue,
             .persist_queue = PersistQueue.init(),
+            .monitor_registry = .{},
+            .monitor_queue = monitor_queue,
+            .monitor_overflow = AtomicBool.init(false),
             .async = async,
             .options = options,
             .limits = limits,
@@ -1441,6 +1758,10 @@ const Worker = struct {
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
             .metrics_timer_completion = &self.metrics_timer_completion,
+            .monitor_registry = &self.monitor_registry,
+            .monitor_queue = &self.monitor_queue,
+            .monitor_overflow = &self.monitor_overflow,
+            .monitor_hub = null,
         };
     }
 
@@ -1464,6 +1785,8 @@ const Worker = struct {
         self.pool.deinit();
         self.queue.deinit(self.allocator);
         self.persist_queue.deinit();
+        self.monitor_queue.deinit(self.allocator);
+        self.monitor_registry.deinit(self.allocator);
         self.async.deinit();
         self.loop.deinit();
     }
@@ -1503,11 +1826,13 @@ fn onWorkerAsync(
     };
 
     drainPersistQueue(&worker.context);
+    drainMonitorQueue(&worker.context);
 
-    while (worker.queue.pop()) |fd| {
-        const tcp = xev.TCP.initFd(fd);
+    while (worker.queue.pop()) |token| {
+        const tcp = xev.TCP.initFd(token.fd);
         if (worker.pool.acquire(tcp)) |conn| {
             conn.server = &worker.context;
+            initClientAddr(conn, tcp, token.is_unix);
             addU64(&worker.connections, 1);
             startKeepalive(conn, &worker.context);
             queueRead(conn, &worker.context);
@@ -1541,6 +1866,7 @@ pub const ThreadedServer = struct {
     next_worker: AtomicUsize,
     bound_address: std.net.Address,
     resource_controls: resource_controls.ResourceControls,
+    monitor_hub: *MonitorHub,
 
     pub fn init(opts: ServerOptions, threads: usize) !ThreadedServer {
         try xev.detect();
@@ -1642,6 +1968,29 @@ pub const ThreadedServer = struct {
             inited += 1;
         }
 
+        const monitor_hub = try opts.allocator.create(MonitorHub);
+        errdefer opts.allocator.destroy(monitor_hub);
+        var monitor_targets = try opts.allocator.alloc(MonitorTarget, worker_count);
+        errdefer opts.allocator.free(monitor_targets);
+        var ti: usize = 0;
+        while (ti < worker_count) : (ti += 1) {
+            monitor_targets[ti] = .{
+                .queue = &workers[ti].monitor_queue,
+                .overflow = &workers[ti].monitor_overflow,
+                .async = &workers[ti].async,
+            };
+        }
+        monitor_hub.* = .{
+            .allocator = opts.allocator,
+            .total = AtomicUsize.init(0),
+            .targets = monitor_targets,
+        };
+
+        i = 0;
+        while (i < worker_count) : (i += 1) {
+            workers[i].context.monitor_hub = monitor_hub;
+        }
+
         i = 0;
         while (i < worker_count) : (i += 1) {
             try workers[i].start();
@@ -1664,6 +2013,7 @@ pub const ThreadedServer = struct {
             .bound_address = bound_address,
             .shutdown_async = shutdown_async,
             .resource_controls = resource_controls.ResourceControls.init(opts.maxmemory_bytes, opts.evict, opts.autosweep),
+            .monitor_hub = monitor_hub,
         };
     }
 
@@ -1678,6 +2028,8 @@ pub const ThreadedServer = struct {
         }
         self.allocator.free(self.workers);
         self.allocator.destroy(self.metrics_context);
+        self.allocator.free(self.monitor_hub.targets);
+        self.allocator.destroy(self.monitor_hub);
         self.resource_controls.stop();
         closeTcpImmediate(self.listener);
         if (self.unix_listener) |listener| {
@@ -1734,11 +2086,11 @@ pub const ThreadedServer = struct {
         }
     }
 
-    fn dispatch(self: *ThreadedServer, fd: std.posix.fd_t) bool {
+    fn dispatch(self: *ThreadedServer, token: AcceptToken) bool {
         if (self.workers.len == 0) return false;
         const idx = self.next_worker.fetchAdd(1, .monotonic) % self.workers.len;
         const worker = &self.workers[idx];
-        if (!worker.queue.push(fd)) return false;
+        if (!worker.queue.push(token)) return false;
         worker.async.notify() catch {};
         return true;
     }
@@ -1771,7 +2123,7 @@ fn handleThreadedAccept(server: *ThreadedServer, result: xev.AcceptError!xev.TCP
             subUsize(&server.metrics.active_connections, 1);
             addU64(&server.metrics.errors.pool_full, 1);
             closeTcpImmediate(tcp);
-        } else if (!server.dispatch(tcp.fd())) {
+        } else if (!server.dispatch(.{ .fd = tcp.fd(), .is_unix = is_unix })) {
             subUsize(&server.metrics.active_connections, 1);
             addU64(&server.metrics.errors.pool_full, 1);
             closeTcpImmediate(tcp);
@@ -2223,8 +2575,8 @@ test "resp large response grows buffers" {
 
     try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
 
-    var resp_buf = std.ArrayList(u8).init(allocator);
-    defer resp_buf.deinit();
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(allocator);
 
     var tmp: [1024]u8 = undefined;
     var bulk_ok = false;
@@ -2232,7 +2584,7 @@ test "resp large response grows buffers" {
     while (attempt < 200 and !bulk_ok) : (attempt += 1) {
         const n = try stream.reader().read(&tmp);
         if (n == 0) break;
-        try resp_buf.appendSlice(tmp[0..n]);
+        try resp_buf.appendSlice(allocator, tmp[0..n]);
         const data = resp_buf.items;
         const dollar = std.mem.indexOfScalar(u8, data, '$') orelse continue;
         const line_end = std.mem.indexOfPos(u8, data, dollar, "\r\n") orelse continue;
@@ -2278,6 +2630,96 @@ test "resp ops commands return pong and stats" {
     try stream.writer().writeAll("*1\r\n$5\r\nSTATS\r\n");
     n = try stream.reader().read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "cache.items") != null);
+}
+
+test "resp monitor streams commands and closes on non-ping" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+    });
+    defer harness.stop();
+
+    var monitor = try connectRetry(harness.server.address());
+    defer monitor.close();
+
+    try monitor.writer().writeAll("*1\r\n$7\r\nMONITOR\r\n");
+    var ok_buf: [64]u8 = undefined;
+    var ok_used: usize = 0;
+    var ok_found = false;
+    var attempt: usize = 0;
+    while (attempt < 5 and ok_used < ok_buf.len) : (attempt += 1) {
+        const n = try monitor.reader().read(ok_buf[ok_used..]);
+        if (n == 0) break;
+        ok_used += n;
+        if (std.mem.indexOf(u8, ok_buf[0..ok_used], "+OK\r\n") != null) {
+            ok_found = true;
+            break;
+        }
+    }
+    try std.testing.expect(ok_found);
+
+    var client = try connectRetry(harness.server.address());
+    defer client.close();
+    try client.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    var client_buf: [128]u8 = undefined;
+    _ = try client.reader().read(&client_buf);
+
+    var monitor_buf = std.ArrayList(u8).empty;
+    defer monitor_buf.deinit(allocator);
+    var tmp: [256]u8 = undefined;
+    var seen = false;
+    attempt = 0;
+    while (attempt < 20 and !seen) : (attempt += 1) {
+        const n = try monitor.reader().read(&tmp);
+        if (n == 0) break;
+        try monitor_buf.appendSlice(allocator, tmp[0..n]);
+        const data = monitor_buf.items;
+        if (std.mem.indexOf(u8, data, "\"GET\" \"a\"") != null and
+            std.mem.indexOf(u8, data, "[0 127.0.0.1:") != null)
+        {
+            seen = true;
+        }
+    }
+    try std.testing.expect(seen);
+
+    var monitor2 = try connectRetry(harness.server.address());
+    defer monitor2.close();
+    try monitor2.writer().writeAll("*1\r\n$7\r\nMONITOR\r\n");
+    var ok2_buf: [64]u8 = undefined;
+    var ok2_used: usize = 0;
+    var ok2_found = false;
+    attempt = 0;
+    while (attempt < 5 and ok2_used < ok2_buf.len) : (attempt += 1) {
+        const n = try monitor2.reader().read(ok2_buf[ok2_used..]);
+        if (n == 0) break;
+        ok2_used += n;
+        if (std.mem.indexOf(u8, ok2_buf[0..ok2_used], "+OK\r\n") != null) {
+            ok2_found = true;
+            break;
+        }
+    }
+    try std.testing.expect(ok2_found);
+
+    try monitor2.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    var closed = false;
+    attempt = 0;
+    while (attempt < 10) : (attempt += 1) {
+        const n = try monitor2.reader().read(&tmp);
+        if (n == 0) {
+            closed = true;
+            break;
+        }
+    }
+    try std.testing.expect(closed);
 }
 
 test "resp malformed request returns error and closes" {

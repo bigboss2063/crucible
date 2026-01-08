@@ -56,6 +56,7 @@ pub fn executeResp(
         .ping => handleRespPing(out, allow_resize),
         .info => handleRespInfo(out, allow_resize, stats_snapshot),
         .stats => handleRespInfo(out, allow_resize, stats_snapshot),
+        .monitor => error.AsyncRequired,
     };
 }
 

@@ -67,6 +67,9 @@ pub const Connection = struct {
     persist_state: PersistState,
     persist_response_ok: bool,
     persist_close_after: bool,
+    monitoring: bool,
+    client_addr_buf: [64]u8,
+    client_addr_len: usize,
     closing: bool,
     close_queued: bool,
     close_done: bool,
@@ -115,6 +118,9 @@ pub const Connection = struct {
             .persist_state = .idle,
             .persist_response_ok = false,
             .persist_close_after = false,
+            .monitoring = false,
+            .client_addr_buf = undefined,
+            .client_addr_len = 0,
             .closing = false,
             .close_queued = false,
             .close_done = false,
@@ -147,6 +153,8 @@ pub const Connection = struct {
         self.persist_state = .idle;
         self.persist_response_ok = false;
         self.persist_close_after = false;
+        self.monitoring = false;
+        self.client_addr_len = 0;
         self.closing = false;
         self.close_queued = false;
         self.close_done = false;
@@ -166,6 +174,10 @@ pub const Connection = struct {
         self.close_completion = .{};
         self.timer = try xev.Timer.init();
         self.pending_metrics.reset();
+    }
+
+    pub fn clientAddr(self: *const Connection) []const u8 {
+        return self.client_addr_buf[0..self.client_addr_len];
     }
 };
 
@@ -244,6 +256,8 @@ pub const ConnectionPool = struct {
         conn.keepalive = false;
         conn.write_in_progress = false;
         conn.read_needs_more = false;
+        conn.monitoring = false;
+        conn.client_addr_len = 0;
         conn.closing = false;
         conn.close_queued = false;
         conn.close_done = false;

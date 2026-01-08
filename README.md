@@ -182,6 +182,23 @@ pub fn main() !void {
 }
 ```
 
+### Command Monitoring (RESP MONITOR)
+
+The RESP `MONITOR` command switches a connection into monitoring mode and
+streams every accepted command (excluding the `MONITOR` request itself).
+
+Line format:
+
+```
++<unix_time_seconds>.<micros> [0 <client_addr>] "ARG0" "ARG1" ...
+```
+
+Notes:
+
+- `client_addr` is `ip:port` for TCP and `unix` for Unix sockets.
+- Escapes include `\n`, `\r`, `\t`, `\"`, `\\`, and non-printable bytes as `\xNN`.
+- While monitoring, only `PING` is accepted; any other command closes the connection.
+
 ### Metrics
 
 `Server.metricsSnapshot()` returns counters for connections, requests, bytes,
@@ -250,6 +267,6 @@ RESP commands:
 * [X]  Background autosweep and RSS-based maxmemory monitoring with low-memory eviction gating.
 * [X]  HTTP/RESP server layer with protocol auto-detection and incremental parsing.
 * [X]  Metrics endpoints over HTTP (`/@health`, `/@stats`) and RESP (`INFO`, `STATS`).
+* [X]  RESP command monitoring stream via `MONITOR`.
 * [X]  Snapshot persistence with `SAVE`/`LOAD` (including `FAST` mode).
 * [ ]  Security: TLS and auth token support.
-* [ ]  Ops: structured logging and benchmarking harness.
