@@ -20,6 +20,10 @@ pub const Protocol = enum {
 
 pub const Limits = comptime_parser.Limits;
 
+const default_read_buffer_bytes: usize = 16 * 1024;
+const default_write_buffer_bytes: usize = 16 * 1024;
+const default_request_bytes: usize = 1024 * 1024;
+
 pub const ServerOptions = struct {
     allocator: std.mem.Allocator,
     cache: *cache.api.Cache,
@@ -28,10 +32,6 @@ pub const ServerOptions = struct {
     address: std.net.Address,
     protocol: Protocol = .auto,
     max_connections: usize = 10_000,
-    read_buffer_bytes: usize = 16 * 1024,
-    write_buffer_bytes: usize = 16 * 1024,
-    max_request_bytes: usize = 1024 * 1024,
-    max_response_bytes: usize = 1024 * 1024,
     keepalive_timeout_ns: u64 = 60 * std.time.ns_per_s,
     backlog: u31 = 128,
     loop_entries: u32 = 256,
@@ -360,13 +360,10 @@ pub const Server = struct {
 
     pub fn initInPlace(self: *Server, opts: ServerOptions) !void {
         try xev.detect();
-        if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
-        if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
-        if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
         if (opts.unix_path != null and !std.net.has_unix_sockets) return error.UnixSocketUnsupported;
         const limits = Limits{
-            .max_key_length = opts.max_request_bytes,
-            .max_value_length = opts.max_request_bytes,
+            .max_key_length = default_request_bytes,
+            .max_value_length = default_request_bytes,
             .max_args = 32,
         };
         const metrics = try opts.allocator.create(AtomicMetrics);
@@ -412,10 +409,8 @@ pub const Server = struct {
         var pool = try connection.ConnectionPool.init(
             opts.allocator,
             opts.max_connections,
-            opts.read_buffer_bytes,
-            opts.write_buffer_bytes,
-            opts.max_request_bytes,
-            opts.max_response_bytes,
+            default_read_buffer_bytes,
+            default_write_buffer_bytes,
             limits,
         );
         errdefer pool.deinit();
@@ -613,7 +608,7 @@ fn onAcceptUnix(
 }
 
 fn queueRead(conn: *connection.Connection, ctx: *ServerContext) void {
-    const read_chunk = ctx.options.read_buffer_bytes;
+    const read_chunk = default_read_buffer_bytes;
     const needs_reserve = !conn.read_needs_more or conn.read_buf.availableTail() < read_chunk;
     if (needs_reserve) {
         if (!conn.read_buf.reserve(read_chunk)) {
@@ -756,6 +751,12 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
     }
 }
 
+fn selectWriteBuffer(conn: *connection.Connection) *buffer.LinearBuffer {
+    if (conn.write_in_progress) return &conn.pending_write_buf;
+    if (conn.pending_write_buf.readable().len != 0) return &conn.pending_write_buf;
+    return &conn.write_buf;
+}
+
 fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: http.Command) void {
     switch (cmd) {
         .save => |save_cmd| {
@@ -777,14 +778,13 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
         },
         else => {},
     }
-    const allow_resize = !conn.write_in_progress;
     const result = execute.executeHttp(
         ctx.cache,
         cmd,
         ctx.resource_controls,
         conn.keepalive,
-        &conn.write_buf,
-        allow_resize,
+        selectWriteBuffer(conn),
+        true,
         snapshot,
     ) catch {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
@@ -818,13 +818,12 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
         },
         else => {},
     }
-    const allow_resize = !conn.write_in_progress;
     const result = execute.executeResp(
         ctx.cache,
         cmd,
         ctx.resource_controls,
-        &conn.write_buf,
-        allow_resize,
+        selectWriteBuffer(conn),
+        true,
         snapshot,
     ) catch {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
@@ -920,10 +919,10 @@ fn writePersistFailure(
     http_code: u16,
     http_reason: []const u8,
 ) bool {
-    const allow_resize = !conn.write_in_progress;
+    const out = selectWriteBuffer(conn);
     const wrote = switch (conn.protocol) {
-        .http => writeHttpResponse(&conn.write_buf, allow_resize, http_code, http_reason, conn.keepalive),
-        .resp => writeRespError(&conn.write_buf, allow_resize, resp_msg),
+        .http => writeHttpResponse(out, true, http_code, http_reason, conn.keepalive),
+        .resp => writeRespError(out, true, resp_msg),
         .unknown => false,
     };
     if (!wrote) return false;
@@ -955,15 +954,16 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
         return;
     }
 
+    const out = selectWriteBuffer(conn);
     const wrote = switch (conn.protocol) {
         .http => if (ok)
-            writeHttpResponseWithBody(&conn.write_buf, true, 200, "OK", "OK", conn.keepalive)
+            writeHttpResponseWithBody(out, true, 200, "OK", "OK", conn.keepalive)
         else
-            writeHttpResponse(&conn.write_buf, true, 500, "Internal Server Error", conn.keepalive),
+            writeHttpResponse(out, true, 500, "Internal Server Error", conn.keepalive),
         .resp => if (ok)
-            writeRespSimple(&conn.write_buf, true, "OK")
+            writeRespSimple(out, true, "OK")
         else
-            writeRespError(&conn.write_buf, true, "ERR persistence failed"),
+            writeRespError(out, true, "ERR persistence failed"),
         .unknown => false,
     };
 
@@ -1004,6 +1004,9 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
 
 fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
     if (conn.write_in_progress) return;
+    if (conn.write_buf.readable().len == 0 and conn.pending_write_buf.readable().len != 0) {
+        std.mem.swap(buffer.LinearBuffer, &conn.write_buf, &conn.pending_write_buf);
+    }
     const slice = conn.write_buf.readable();
     if (slice.len == 0) {
         if (conn.closing) closeConnection(conn, ctx);
@@ -1129,8 +1132,8 @@ fn writeHttpBadRequest(conn: *connection.Connection, ctx: *ServerContext) bool {
 }
 
 fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, reason: []const u8) bool {
-    const allow_resize = !conn.write_in_progress;
-    if (!writeHttpResponse(&conn.write_buf, allow_resize, code, reason, false)) {
+    const out = selectWriteBuffer(conn);
+    if (!writeHttpResponse(out, true, code, reason, false)) {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         closeConnection(conn, ctx);
         return false;
@@ -1140,8 +1143,8 @@ fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, 
 }
 
 fn writeRespErrorResponse(conn: *connection.Connection, ctx: *ServerContext, msg: []const u8) bool {
-    const allow_resize = !conn.write_in_progress;
-    if (!writeRespError(&conn.write_buf, allow_resize, msg)) {
+    const out = selectWriteBuffer(conn);
+    if (!writeRespError(out, true, msg)) {
         addU64(&ctx.metrics.errors.buffer_overflow, 1);
         closeConnection(conn, ctx);
         return false;
@@ -1384,10 +1387,8 @@ const Worker = struct {
         var pool = try connection.ConnectionPool.init(
             allocator,
             pool_size,
-            options.read_buffer_bytes,
-            options.write_buffer_bytes,
-            options.max_request_bytes,
-            options.max_response_bytes,
+            default_read_buffer_bytes,
+            default_write_buffer_bytes,
             limits,
         );
         errdefer pool.deinit();
@@ -1537,13 +1538,10 @@ pub const ThreadedServer = struct {
 
     pub fn init(opts: ServerOptions, threads: usize) !ThreadedServer {
         try xev.detect();
-        if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidOptions;
-        if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidOptions;
-        if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidOptions;
         if (opts.unix_path != null and !std.net.has_unix_sockets) return error.UnixSocketUnsupported;
         const limits = Limits{
-            .max_key_length = opts.max_request_bytes,
-            .max_value_length = opts.max_request_bytes,
+            .max_key_length = default_request_bytes,
+            .max_value_length = default_request_bytes,
             .max_args = 32,
         };
 
@@ -1940,8 +1938,6 @@ test "server accepts HTTP connections" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -1982,8 +1978,6 @@ test "unix socket accepts RESP connections" {
         .address = addr,
         .protocol = .resp,
         .unix_path = socket_path,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
     defer std.posix.unlink(socket_path) catch {};
@@ -2017,8 +2011,6 @@ test "http end-to-end commands with keepalive" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2057,8 +2049,6 @@ test "http ops endpoints return health and stats" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2090,8 +2080,6 @@ test "http malformed request returns 400 and closes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2134,8 +2122,6 @@ test "threaded server connection churn" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
         .keepalive_timeout_ns = 5 * std.time.ns_per_ms,
     }, 2);
     defer harness.stop();
@@ -2168,8 +2154,6 @@ test "resp end-to-end and pipeline" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .auto,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2187,7 +2171,7 @@ test "resp end-to-end and pipeline" {
     try std.testing.expect(std.mem.count(u8, out, "$1\r\n1\r\n") == 2);
 }
 
-test "resp pipeline spans small read buffers" {
+test "resp large response grows buffers" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -2200,75 +2184,61 @@ test "resp pipeline spans small read buffers" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .resp,
-        .read_buffer_bytes = 4,
-        .write_buffer_bytes = 64,
-        .max_request_bytes = 128,
-        .max_response_bytes = 128,
     });
     defer harness.stop();
 
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    const value = "0123456789abcdefghij";
-    try stream.writer().writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$20\r\n");
+    const value_len = default_read_buffer_bytes + 1024;
+    const value = try allocator.alloc(u8, value_len);
+    defer allocator.free(value);
+    @memset(value, 'a');
+
+    var header_buf: [128]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "*3\r\n$3\r\nSET\r\n$1\r\na\r\n${d}\r\n",
+        .{value_len},
+    );
+    try stream.writer().writeAll(header);
     try stream.writer().writeAll(value);
-    try stream.writer().writeAll("\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    try stream.writer().writeAll("\r\n");
 
-    var buf: [512]u8 = undefined;
-    var used: usize = 0;
-    var ok_found = false;
-    var value_count: usize = 0;
-    var reads: usize = 0;
-    while (reads < 5 and used < buf.len and (!ok_found or value_count < 2)) : (reads += 1) {
-        const n = try stream.reader().read(buf[used..]);
+    var ack_buf: [64]u8 = undefined;
+    var ack_used: usize = 0;
+    while (ack_used < ack_buf.len) {
+        const n = try stream.reader().read(ack_buf[ack_used..]);
         if (n == 0) break;
-        used += n;
-        const out = buf[0..used];
-        ok_found = std.mem.indexOf(u8, out, "+OK\r\n") != null;
-        value_count = std.mem.count(u8, out, value);
+        ack_used += n;
+        if (std.mem.indexOf(u8, ack_buf[0..ack_used], "+OK\r\n") != null) break;
     }
+    try std.testing.expect(std.mem.indexOf(u8, ack_buf[0..ack_used], "+OK\r\n") != null);
 
-    try std.testing.expect(ok_found);
-    try std.testing.expectEqual(@as(usize, 2), value_count);
-}
+    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
 
-test "resp response overflow increments buffer_overflow" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 4 });
-    defer cache.engine.deinit(cache_instance);
+    var resp_buf = std.ArrayList(u8).init(allocator);
+    defer resp_buf.deinit();
 
-    var value_buf: [64]u8 = undefined;
-    for (value_buf[0..]) |*b| b.* = 'a';
-    _ = try cache.engine.store(cache_instance, "k", value_buf[0..], .{});
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var harness = try TestServer.start(.{
-        .allocator = allocator,
-        .cache = cache_instance,
-        .address = addr,
-        .protocol = .resp,
-        .read_buffer_bytes = 16,
-        .write_buffer_bytes = 16,
-        .max_request_bytes = 64,
-        .max_response_bytes = 64,
-    });
-    defer harness.stop();
-
-    var stream = try connectRetry(harness.server.address());
-    defer stream.close();
-
-    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
-
-    var metrics = harness.server.metricsSnapshot();
+    var tmp: [1024]u8 = undefined;
+    var bulk_ok = false;
     var attempt: usize = 0;
-    while (attempt < 50 and metrics.errors.buffer_overflow == 0) : (attempt += 1) {
-        std.Thread.sleep(5 * std.time.ns_per_ms);
-        metrics = harness.server.metricsSnapshot();
+    while (attempt < 200 and !bulk_ok) : (attempt += 1) {
+        const n = try stream.reader().read(&tmp);
+        if (n == 0) break;
+        try resp_buf.appendSlice(tmp[0..n]);
+        const data = resp_buf.items;
+        const dollar = std.mem.indexOfScalar(u8, data, '$') orelse continue;
+        const line_end = std.mem.indexOfPos(u8, data, dollar, "\r\n") orelse continue;
+        const len_slice = data[dollar + 1 .. line_end];
+        const bulk_len = std.fmt.parseInt(usize, len_slice, 10) catch continue;
+        const needed = line_end + 2 + bulk_len + 2;
+        if (data.len < needed) continue;
+        const value_slice = data[line_end + 2 .. line_end + 2 + bulk_len];
+        bulk_ok = std.mem.eql(u8, value_slice, value);
     }
-    try std.testing.expect(metrics.errors.buffer_overflow >= 1);
+
+    try std.testing.expect(bulk_ok);
 }
 
 test "resp ops commands return pong and stats" {
@@ -2284,8 +2254,6 @@ test "resp ops commands return pong and stats" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .resp,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2319,8 +2287,6 @@ test "resp malformed request returns error and closes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .resp,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer harness.stop();
 
@@ -2349,8 +2315,6 @@ test "concurrent connections" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
         .max_connections = 16,
     });
     defer harness.stop();
@@ -2385,8 +2349,6 @@ test "metrics snapshot tracks requests and bytes" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     var stopped = false;
     defer if (!stopped) harness.stop();
@@ -2424,8 +2386,6 @@ test "pool exhaustion increments pool_full" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
         .max_connections = 1,
     });
     var stopped = false;
@@ -2472,8 +2432,6 @@ test "threaded server dispatches across workers" {
         .cache = cache_instance,
         .address = addr,
         .protocol = .http,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
         .max_connections = 8,
     }, 2);
     var stopped = false;

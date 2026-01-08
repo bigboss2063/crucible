@@ -43,15 +43,15 @@ Server defaults (binary):
 - Max connections: 10,000 (buffers are preallocated)
 - Backlog: 128
 - Event loop entries: 256
-- Buffer size: 4096 bytes (read/write/scratch per connection)
+- Read/write buffers: 16KB initial, grow on demand
 - Keepalive: 60s
 - Max memory: 80% of system memory (RSS-based); eviction and autosweep enabled
   by default; `--maxmemory unlimited` disables eviction
 
 Protocol limits (server):
 
-- Max key length: buffer size
-- Max value length: buffer size
+- Max key length: 1MB (fixed)
+- Max value length: 1MB (fixed)
 - Max RESP args: 32
 
 ## Getting Started
@@ -175,8 +175,6 @@ pub fn main() !void {
         .cache = cache,
         .address = try std.net.Address.parseIp("127.0.0.1", 8080),
         .protocol = .auto,
-        .read_buffer_bytes = 4096,
-        .write_buffer_bytes = 4096,
     });
     defer server.deinit();
 

@@ -600,7 +600,7 @@ test "http execution stores and loads" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 512, 512);
+    var rb = try buffer.LinearBuffer.init(allocator, 512);
     defer rb.deinit();
 
     _ = try executeHttp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .xx = false } }, null, false, &rb, true, null);
@@ -619,7 +619,7 @@ test "http execution put missing returns 404" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 256, 256);
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
     defer rb.deinit();
 
     _ = try executeHttp(cache_instance, .{ .set = .{ .key = "missing", .value = "v", .xx = true } }, null, false, &rb, true, null);
@@ -633,7 +633,7 @@ test "resp execution set/get" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 256, 256);
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
     defer rb.deinit();
 
     _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, &rb, true, null);
@@ -651,7 +651,7 @@ test "resp execution honors nx/xx options" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 256, 256);
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
     defer rb.deinit();
 
     _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, &rb, true, null);
@@ -672,7 +672,7 @@ test "resp execution incr rejects non-integer" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 256, 256);
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
     defer rb.deinit();
 
     _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "abc", .options = .{} } }, null, &rb, true, null);
@@ -689,7 +689,7 @@ test "resp execution ttl missing returns -2" {
     const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
     defer cache_mod.engine.deinit(cache_instance);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 256, 256);
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
     defer rb.deinit();
 
     _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "missing" } }, null, &rb, true, null);
@@ -706,7 +706,7 @@ test "resp execution rejects writes when lowmem and eviction disabled" {
     var controls = resource_controls.ResourceControls.init(null, false, false);
     controls.lowmem.store(true, .release);
 
-    var rb = try buffer.LinearBuffer.init(allocator, 128, 128);
+    var rb = try buffer.LinearBuffer.init(allocator, 128);
     defer rb.deinit();
 
     _ = try executeResp(

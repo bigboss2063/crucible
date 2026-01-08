@@ -67,13 +67,18 @@ pub const ParseResult = union(enum) {
 
 pub const MaxArgs: usize = 32;
 
+const Arg = struct {
+    start: usize,
+    len: usize,
+};
+
 pub const State = struct {
     stage: Stage = .start,
     offset: usize = 0,
     array_len: usize = 0,
     arg_index: usize = 0,
     bulk_len: usize = 0,
-    args: [MaxArgs][]const u8 = undefined,
+    args: [MaxArgs]Arg = undefined,
 };
 
 const Stage = enum {
@@ -132,7 +137,7 @@ pub fn parse(state: *State, buf: []const u8, limits: Limits, eof: bool) ParseRes
             },
             .bulk_len => {
                 if (state.arg_index >= state.array_len) {
-                    const cmd = buildCommand(state, limits) catch |err| {
+                    const cmd = buildCommand(state, buf, limits) catch |err| {
                         state.* = initState();
                         return .{ .err = err };
                     };
@@ -181,7 +186,7 @@ pub fn parse(state: *State, buf: []const u8, limits: Limits, eof: bool) ParseRes
                     state.* = initState();
                     return .{ .err = Error.MalformedRequest };
                 }
-                state.args[state.arg_index] = buf[pos .. pos + state.bulk_len];
+                state.args[state.arg_index] = .{ .start = pos, .len = state.bulk_len };
                 state.arg_index += 1;
                 pos = needed;
                 state.stage = .bulk_len;
@@ -197,9 +202,18 @@ fn parseNumber(slice: []const u8) Error!i64 {
     return std.fmt.parseInt(i64, slice, 10) catch Error.InvalidNumber;
 }
 
-fn buildCommand(state: *const State, limits: Limits) Error!Command {
+fn buildCommand(state: *const State, buf: []const u8, limits: Limits) Error!Command {
     if (state.array_len == 0) return Error.MalformedRequest;
-    const args = state.args[0..state.array_len];
+    var args_buf: [MaxArgs][]const u8 = undefined;
+    var idx: usize = 0;
+    while (idx < state.array_len) : (idx += 1) {
+        const arg = state.args[idx];
+        if (arg.start > buf.len) return Error.MalformedRequest;
+        const remaining = buf.len - arg.start;
+        if (arg.len > remaining) return Error.MalformedRequest;
+        args_buf[idx] = buf[arg.start .. arg.start + arg.len];
+    }
+    const args = args_buf[0..state.array_len];
     const cmd = args[0];
     if (std.ascii.eqlIgnoreCase(cmd, "PING")) {
         if (args.len != 1) return Error.MalformedRequest;

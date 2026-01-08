@@ -6,16 +6,14 @@ pub const LinearBuffer = struct {
     start: usize,
     len: usize,
     init_cap: usize,
-    max_cap: usize,
 
     fn assertInvariants(self: *const LinearBuffer) void {
         std.debug.assert(self.start + self.len <= self.storage.len);
         std.debug.assert(self.storage.len >= self.init_cap);
-        std.debug.assert(self.max_cap >= self.init_cap);
     }
 
-    pub fn init(allocator: std.mem.Allocator, init_cap: usize, max_cap: usize) !LinearBuffer {
-        if (init_cap == 0 or max_cap < init_cap) return error.InvalidCapacity;
+    pub fn init(allocator: std.mem.Allocator, init_cap: usize) !LinearBuffer {
+        if (init_cap == 0) return error.InvalidCapacity;
         const storage = try allocator.alloc(u8, init_cap);
         return .{
             .allocator = allocator,
@@ -23,7 +21,6 @@ pub const LinearBuffer = struct {
             .start = 0,
             .len = 0,
             .init_cap = init_cap,
-            .max_cap = max_cap,
         };
     }
 
@@ -59,10 +56,10 @@ pub const LinearBuffer = struct {
     pub fn reserve(self: *LinearBuffer, min_free: usize) bool {
         self.assertInvariants();
         if (min_free == 0) return true;
-        if (self.len + min_free > self.max_cap) return false;
+        const needed = std.math.add(usize, self.len, min_free) catch return false;
         self.compactIfNeeded(min_free);
         if (self.availableTail() >= min_free) return true;
-        if (!self.grow(min_free)) return false;
+        if (!self.grow(needed)) return false;
         return self.availableTail() >= min_free;
     }
 
@@ -115,16 +112,13 @@ pub const LinearBuffer = struct {
         self.start = 0;
     }
 
-    fn grow(self: *LinearBuffer, min_free: usize) bool {
+    fn grow(self: *LinearBuffer, needed: usize) bool {
         self.assertInvariants();
-        const needed = self.len + min_free;
-        if (needed > self.max_cap) return false;
         var new_cap = self.storage.len;
         while (new_cap < needed) {
-            new_cap *= 2;
-        }
-        if (new_cap > self.max_cap) {
-            new_cap = self.max_cap;
+            const next = std.math.mul(usize, new_cap, 2) catch return false;
+            if (next <= new_cap) return false;
+            new_cap = next;
         }
         if (new_cap == self.storage.len) return true;
         const resized = self.allocator.realloc(self.storage, new_cap) catch return false;
@@ -134,7 +128,7 @@ pub const LinearBuffer = struct {
 };
 
 test "linear buffer basic write/read/consume" {
-    var storage = try LinearBuffer.init(std.testing.allocator, 8, 16);
+    var storage = try LinearBuffer.init(std.testing.allocator, 8);
     defer storage.deinit();
 
     try std.testing.expect(storage.write("abcd"));
@@ -145,7 +139,7 @@ test "linear buffer basic write/read/consume" {
 }
 
 test "linear buffer compacts on demand" {
-    var buf = try LinearBuffer.init(std.testing.allocator, 8, 8);
+    var buf = try LinearBuffer.init(std.testing.allocator, 8);
     defer buf.deinit();
 
     try std.testing.expect(buf.write("abcdef"));
@@ -159,8 +153,8 @@ test "linear buffer compacts on demand" {
     try std.testing.expectEqualSlices(u8, "efghij", buf.readable());
 }
 
-test "linear buffer grows to max" {
-    var buf = try LinearBuffer.init(std.testing.allocator, 4, 16);
+test "linear buffer grows on demand" {
+    var buf = try LinearBuffer.init(std.testing.allocator, 4);
     defer buf.deinit();
 
     try std.testing.expect(buf.write("abcd"));
@@ -168,12 +162,4 @@ test "linear buffer grows to max" {
     try std.testing.expect(buf.storage.len >= 10);
     try std.testing.expect(buf.write("efghij"));
     try std.testing.expectEqualSlices(u8, "abcdefghij", buf.readable());
-}
-
-test "linear buffer refuses over max" {
-    var buf = try LinearBuffer.init(std.testing.allocator, 4, 8);
-    defer buf.deinit();
-
-    try std.testing.expect(buf.write("abcd"));
-    try std.testing.expect(!buf.write("efghi"));
 }

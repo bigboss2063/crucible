@@ -51,10 +51,6 @@ const CliOptions = struct {
     max_connections: usize,
     backlog: u31,
     loop_entries: u32,
-    read_buffer_bytes: usize,
-    write_buffer_bytes: usize,
-    max_request_bytes: usize,
-    max_response_bytes: usize,
     keepalive_ms: u64,
     cache_nshards: u32,
     cache_loadfactor: u8,
@@ -83,10 +79,6 @@ fn defaultOptions(sysmem: u64) ParseError!CliOptions {
         .max_connections = 10_000,
         .backlog = 128,
         .loop_entries = 256,
-        .read_buffer_bytes = 16 * 1024,
-        .write_buffer_bytes = 16 * 1024,
-        .max_request_bytes = 1024 * 1024,
-        .max_response_bytes = 1024 * 1024,
         .keepalive_ms = 60_000,
         .cache_nshards = 0,
         .cache_loadfactor = 0,
@@ -250,18 +242,6 @@ fn parseArgs(args: []const []const u8) ParseError!CliOptions {
         } else if (std.mem.eql(u8, arg, "--queuesize")) {
             const value = try nextValue(args, &i);
             opts.loop_entries = try parseIntRange(u32, value, 1, std.math.maxInt(u32));
-        } else if (std.mem.eql(u8, arg, "--read-buffer-size")) {
-            const value = try nextValue(args, &i);
-            opts.read_buffer_bytes = try parseIntRange(usize, value, 1, std.math.maxInt(usize));
-        } else if (std.mem.eql(u8, arg, "--write-buffer-size")) {
-            const value = try nextValue(args, &i);
-            opts.write_buffer_bytes = try parseIntRange(usize, value, 1, std.math.maxInt(usize));
-        } else if (std.mem.eql(u8, arg, "--max-request-bytes")) {
-            const value = try nextValue(args, &i);
-            opts.max_request_bytes = try parseIntRange(usize, value, 1, std.math.maxInt(usize));
-        } else if (std.mem.eql(u8, arg, "--max-response-bytes")) {
-            const value = try nextValue(args, &i);
-            opts.max_response_bytes = try parseIntRange(usize, value, 1, std.math.maxInt(usize));
         } else if (std.mem.eql(u8, arg, "--keepalive-ms")) {
             const value = try nextValue(args, &i);
             opts.keepalive_ms = try parseIntRange(u64, value, 0, std.math.maxInt(u64));
@@ -302,10 +282,6 @@ fn parseArgs(args: []const []const u8) ParseError!CliOptions {
         opts.address = std.net.Address.parseIp(host, port) catch return error.InvalidArgs;
     }
 
-    if (opts.read_buffer_bytes > opts.max_request_bytes) return error.InvalidArgs;
-    if (opts.write_buffer_bytes > opts.max_response_bytes) return error.InvalidArgs;
-    if (opts.max_response_bytes < opts.max_request_bytes) return error.InvalidArgs;
-
     if (opts.maxmemory_bytes == null) {
         opts.evict = false;
     }
@@ -331,10 +307,6 @@ fn printUsage(file: std.fs.File) !void {
         \\  --maxconns count        maximum connections          (default: 10000)
         \\  --backlog count         accept backlog               (default: 128)
         \\  --queuesize count       event loop queue size        (default: 256)
-        \\  --read-buffer-size bytes     read buffer size        (default: 16384)
-        \\  --write-buffer-size bytes    write buffer size       (default: 16384)
-        \\  --max-request-bytes bytes    max request size        (default: 1048576)
-        \\  --max-response-bytes bytes   max response size       (default: 1048576)
         \\  --keepalive-ms ms       keepalive timeout            (default: 60000)
         \\
         \\Cache options:
@@ -403,10 +375,6 @@ pub fn main() !void {
         .address = opts.address,
         .protocol = opts.protocol,
         .max_connections = opts.max_connections,
-        .read_buffer_bytes = opts.read_buffer_bytes,
-        .write_buffer_bytes = opts.write_buffer_bytes,
-        .max_request_bytes = opts.max_request_bytes,
-        .max_response_bytes = opts.max_response_bytes,
         .keepalive_timeout_ns = opts.keepalive_ms * std.time.ns_per_ms,
         .backlog = opts.backlog,
         .loop_entries = opts.loop_entries,
@@ -468,10 +436,6 @@ test "parse args defaults" {
     try std.testing.expect(opts.persist_path == null);
     try std.testing.expect(opts.evict);
     try std.testing.expect(opts.autosweep);
-    try std.testing.expectEqual(@as(usize, 16 * 1024), opts.read_buffer_bytes);
-    try std.testing.expectEqual(@as(usize, 16 * 1024), opts.write_buffer_bytes);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), opts.max_request_bytes);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), opts.max_response_bytes);
     try std.testing.expect(opts.unix_path == null);
     const sysmem = try systemMemoryBytes();
     const expected_max = @as(u64, @intFromFloat(@as(f64, @floatFromInt(sysmem)) * 0.8));
@@ -514,38 +478,6 @@ test "parse args cache options" {
     try std.testing.expectEqual(@as(u8, 80), opts.cache_loadfactor);
     try std.testing.expectEqual(true, opts.cache_nosixpack);
     try std.testing.expectEqual(true, opts.cache_usecas);
-}
-
-test "parse args buffer sizing options" {
-    const opts = try parseArgs(&[_][]const u8{
-        "--read-buffer-size",
-        "8192",
-        "--write-buffer-size",
-        "16384",
-        "--max-request-bytes",
-        "65536",
-        "--max-response-bytes",
-        "131072",
-    });
-    try std.testing.expectEqual(@as(usize, 8192), opts.read_buffer_bytes);
-    try std.testing.expectEqual(@as(usize, 16384), opts.write_buffer_bytes);
-    try std.testing.expectEqual(@as(usize, 65536), opts.max_request_bytes);
-    try std.testing.expectEqual(@as(usize, 131072), opts.max_response_bytes);
-}
-
-test "parse args rejects invalid buffer sizing" {
-    try std.testing.expectError(error.InvalidArgs, parseArgs(&[_][]const u8{
-        "--write-buffer-size",
-        "16384",
-        "--max-response-bytes",
-        "4096",
-    }));
-    try std.testing.expectError(error.InvalidArgs, parseArgs(&[_][]const u8{
-        "--max-request-bytes",
-        "8192",
-        "--max-response-bytes",
-        "4096",
-    }));
 }
 
 test "parse args maxmemory and evict" {

@@ -56,6 +56,7 @@ pub const Connection = struct {
     server: ?*anyopaque,
     read_buf: buffer.LinearBuffer,
     write_buf: buffer.LinearBuffer,
+    pending_write_buf: buffer.LinearBuffer,
     protocol: Protocol,
     http_parser: http.Parser,
     resp_parser: resp.Parser,
@@ -89,19 +90,20 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         read_buffer_bytes: usize,
         write_buffer_bytes: usize,
-        max_request_bytes: usize,
-        max_response_bytes: usize,
         limits: Limits,
     ) !Connection {
-        var read_buf = try buffer.LinearBuffer.init(allocator, read_buffer_bytes, max_request_bytes);
+        var read_buf = try buffer.LinearBuffer.init(allocator, read_buffer_bytes);
         errdefer read_buf.deinit();
-        const write_buf = try buffer.LinearBuffer.init(allocator, write_buffer_bytes, max_response_bytes);
+        var write_buf = try buffer.LinearBuffer.init(allocator, write_buffer_bytes);
+        errdefer write_buf.deinit();
+        const pending_write_buf = try buffer.LinearBuffer.init(allocator, write_buffer_bytes);
         return .{
             .id = id,
             .tcp = undefined,
             .server = null,
             .read_buf = read_buf,
             .write_buf = write_buf,
+            .pending_write_buf = pending_write_buf,
             .protocol = .unknown,
             .http_parser = http.Parser.init(limits),
             .resp_parser = resp.Parser.init(limits),
@@ -132,6 +134,7 @@ pub const Connection = struct {
         self.server = null;
         self.read_buf.clear();
         self.write_buf.clear();
+        self.pending_write_buf.clear();
         self.protocol = .unknown;
         self.http_parser = http.Parser.init(limits);
         self.resp_parser = resp.Parser.init(limits);
@@ -168,10 +171,6 @@ pub const ConnectionPool = struct {
     conns: []Connection,
     free: []usize,
     free_len: usize,
-    read_buffer_bytes: usize,
-    write_buffer_bytes: usize,
-    max_request_bytes: usize,
-    max_response_bytes: usize,
     limits: Limits,
 
     pub fn init(
@@ -179,8 +178,6 @@ pub const ConnectionPool = struct {
         max_connections: usize,
         read_buffer_bytes: usize,
         write_buffer_bytes: usize,
-        max_request_bytes: usize,
-        max_response_bytes: usize,
         limits: Limits,
     ) !ConnectionPool {
         var conns = try allocator.alloc(Connection, max_connections);
@@ -195,8 +192,6 @@ pub const ConnectionPool = struct {
                 allocator,
                 read_buffer_bytes,
                 write_buffer_bytes,
-                max_request_bytes,
-                max_response_bytes,
                 limits,
             );
             free[i] = max_connections - 1 - i;
@@ -207,10 +202,6 @@ pub const ConnectionPool = struct {
             .conns = conns,
             .free = free,
             .free_len = max_connections,
-            .read_buffer_bytes = read_buffer_bytes,
-            .write_buffer_bytes = write_buffer_bytes,
-            .max_request_bytes = max_request_bytes,
-            .max_response_bytes = max_response_bytes,
             .limits = limits,
         };
     }
@@ -219,6 +210,7 @@ pub const ConnectionPool = struct {
         for (self.conns) |*conn| {
             conn.read_buf.deinit();
             conn.write_buf.deinit();
+            conn.pending_write_buf.deinit();
         }
         self.allocator.free(self.conns);
         self.allocator.free(self.free);
@@ -243,6 +235,8 @@ pub const ConnectionPool = struct {
         conn.write_buf.clear();
         conn.read_buf.shrinkToInit();
         conn.write_buf.shrinkToInit();
+        conn.pending_write_buf.clear();
+        conn.pending_write_buf.shrinkToInit();
         conn.protocol = .unknown;
         conn.keepalive = false;
         conn.write_in_progress = false;
@@ -272,7 +266,7 @@ test "connection pool acquire and release" {
         .max_value_length = 64,
         .max_args = 32,
     };
-    var pool = try ConnectionPool.init(allocator, 2, 64, 64, 64, 64, limits);
+    var pool = try ConnectionPool.init(allocator, 2, 64, 64, limits);
     defer pool.deinit();
 
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
