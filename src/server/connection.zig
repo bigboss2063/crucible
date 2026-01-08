@@ -62,6 +62,7 @@ pub const Connection = struct {
     resp_parser: resp.Parser,
     keepalive: bool,
     write_in_progress: bool,
+    defer_writes: bool,
     read_needs_more: bool,
     persist_state: PersistState,
     persist_response_ok: bool,
@@ -109,6 +110,7 @@ pub const Connection = struct {
             .resp_parser = resp.Parser.init(limits),
             .keepalive = false,
             .write_in_progress = false,
+            .defer_writes = false,
             .read_needs_more = false,
             .persist_state = .idle,
             .persist_response_ok = false,
@@ -140,6 +142,7 @@ pub const Connection = struct {
         self.resp_parser = resp.Parser.init(limits);
         self.keepalive = false;
         self.write_in_progress = false;
+        self.defer_writes = false;
         self.read_needs_more = false;
         self.persist_state = .idle;
         self.persist_response_ok = false;

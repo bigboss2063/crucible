@@ -668,7 +668,12 @@ fn onRead(
 }
 
 fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
-    defer flushConnectionMetrics(conn, ctx);
+    conn.defer_writes = true;
+    defer {
+        conn.defer_writes = false;
+        queueWrite(conn, ctx);
+        flushConnectionMetrics(conn, ctx);
+    }
     while (true) {
         if (conn.protocol == .unknown) {
             const proto = detectProtocol(conn, ctx.options.protocol);
@@ -1003,6 +1008,7 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
 }
 
 fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
+    if (conn.defer_writes) return;
     if (conn.write_in_progress) return;
     if (conn.write_buf.readable().len == 0 and conn.pending_write_buf.readable().len != 0) {
         std.mem.swap(buffer.LinearBuffer, &conn.write_buf, &conn.pending_write_buf);
