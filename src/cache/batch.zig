@@ -147,8 +147,8 @@ test "thread local batch reuse across threads" {
     ctxs[0] = .{ .cache = &cache };
     ctxs[1] = .{ .cache = &cache };
     var threads: [ctxs.len]std.Thread = undefined;
-    for (ctxs, 0..) |*ctx, i| {
-        threads[i] = try std.Thread.spawn(.{}, threadBatchWorker, .{ctx});
+    for (ctxs, 0..) |_, i| {
+        threads[i] = try std.Thread.spawn(.{}, threadBatchWorker, .{&ctxs[i]});
     }
     for (threads) |thread| {
         thread.join();

@@ -269,4 +269,6 @@ RESP commands:
 * [X]  Metrics endpoints over HTTP (`/@health`, `/@stats`) and RESP (`INFO`, `STATS`).
 * [X]  RESP command monitoring stream via `MONITOR`.
 * [X]  Snapshot persistence with `SAVE`/`LOAD` (including `FAST` mode).
+* [ ]  Protocol compatibility: expand RESP command coverage for broader client interoperability.
+* [ ]  Persistence and recovery: periodic snapshots and incremental/WAL-based recovery.
 * [ ]  Security: TLS and auth token support.

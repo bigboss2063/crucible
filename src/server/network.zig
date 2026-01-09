@@ -2246,7 +2246,7 @@ fn connectUnixRetry(path: []const u8) !std.net.Stream {
 fn readHttpResponse(stream: *std.net.Stream, buf: []u8) ![]const u8 {
     var used: usize = 0;
     while (used < buf.len) {
-        const n = try stream.reader().read(buf[used..]);
+        const n = try stream.read(buf[used..]);
         if (n == 0) break;
         used += n;
         if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n")) |idx| {
@@ -2303,7 +2303,7 @@ test "server accepts HTTP connections" {
     var stream = try connectRetry(bound);
     defer stream.close();
 
-    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream.writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
     var buf: [256]u8 = undefined;
     const res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "404") != null);
@@ -2343,12 +2343,12 @@ test "unix socket accepts RESP connections" {
     var stream = try connectUnixRetry(socket_path);
     defer stream.close();
 
-    try stream.writer().writeAll("*1\r\n$4\r\nPING\r\n");
+    try stream.writeAll("*1\r\n$4\r\nPING\r\n");
     var buf: [64]u8 = undefined;
     var used: usize = 0;
     var attempt: usize = 0;
     while (attempt < 5 and used < buf.len) : (attempt += 1) {
-        const n = try stream.reader().read(buf[used..]);
+        const n = try stream.read(buf[used..]);
         if (n == 0) break;
         used += n;
         if (std.mem.indexOf(u8, buf[0..used], "+PONG\r\n") != null) break;
@@ -2368,28 +2368,28 @@ test "http end-to-end commands with keepalive" {
         .allocator = allocator,
         .cache = cache_instance,
         .address = addr,
-        .protocol = .auto,
+        .protocol = .http,
     });
     defer harness.stop();
 
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("POST /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nv");
+    try stream.writeAll("POST /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nv");
     var buf: [512]u8 = undefined;
     var res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "201") != null);
 
-    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    try stream.writeAll("GET /k HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
     res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "\r\n\r\nv") != null);
 
-    try stream.writer().writeAll("PUT /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nvv");
+    try stream.writeAll("PUT /k HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nvv");
     res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
 
-    try stream.writer().writeAll("DELETE /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream.writeAll("DELETE /k HTTP/1.1\r\nConnection: close\r\n\r\n");
     res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
 }
@@ -2413,13 +2413,13 @@ test "http ops endpoints return health and stats" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("GET /@health HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    try stream.writeAll("GET /@health HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
     var buf: [512]u8 = undefined;
     var res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "\r\n\r\nOK") != null);
 
-    try stream.writer().writeAll("GET /@stats HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream.writeAll("GET /@stats HTTP/1.1\r\nConnection: close\r\n\r\n");
     res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "\"server\"") != null);
@@ -2437,18 +2437,18 @@ test "http malformed request returns 400 and closes" {
         .allocator = allocator,
         .cache = cache_instance,
         .address = addr,
-        .protocol = .auto,
+        .protocol = .http,
     });
     defer harness.stop();
 
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("TRACE /k HTTP/1.1\r\n\r\n");
+    try stream.writeAll("TRACE /k HTTP/1.1\r\n\r\n");
     var buf: [256]u8 = undefined;
     const res = try readHttpResponse(&stream, &buf);
     try std.testing.expect(std.mem.indexOf(u8, res, "400") != null);
-    const n = try stream.reader().read(&buf);
+    const n = try stream.read(&buf);
     try std.testing.expect(n == 0);
 }
 
@@ -2459,9 +2459,9 @@ fn churnWorker(addr: std.net.Address, iterations: usize, sleep_ns: u64) void {
         if (i % 3 == 0) {
             std.Thread.sleep(sleep_ns);
         } else if (i % 3 == 1) {
-            stream.writer().writeAll("GET /k HTTP/1.1\r\n") catch {};
+            stream.writeAll("GET /k HTTP/1.1\r\n") catch {};
         } else {
-            stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch {};
+            stream.writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch {};
         }
         stream.close();
     }
@@ -2518,13 +2518,13 @@ test "resp end-to-end and pipeline" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+    try stream.writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
     var buf: [256]u8 = undefined;
-    var n = try stream.reader().read(&buf);
+    var n = try stream.read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "+OK") != null);
 
-    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
-    n = try stream.reader().read(&buf);
+    try stream.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    n = try stream.read(&buf);
     const out = buf[0..n];
     try std.testing.expect(std.mem.count(u8, out, "$1\r\n1\r\n") == 2);
 }
@@ -2559,21 +2559,21 @@ test "resp large response grows buffers" {
         "*3\r\n$3\r\nSET\r\n$1\r\na\r\n${d}\r\n",
         .{value_len},
     );
-    try stream.writer().writeAll(header);
-    try stream.writer().writeAll(value);
-    try stream.writer().writeAll("\r\n");
+    try stream.writeAll(header);
+    try stream.writeAll(value);
+    try stream.writeAll("\r\n");
 
     var ack_buf: [64]u8 = undefined;
     var ack_used: usize = 0;
     while (ack_used < ack_buf.len) {
-        const n = try stream.reader().read(ack_buf[ack_used..]);
+        const n = try stream.read(ack_buf[ack_used..]);
         if (n == 0) break;
         ack_used += n;
         if (std.mem.indexOf(u8, ack_buf[0..ack_used], "+OK\r\n") != null) break;
     }
     try std.testing.expect(std.mem.indexOf(u8, ack_buf[0..ack_used], "+OK\r\n") != null);
 
-    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    try stream.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
 
     var resp_buf = std.ArrayList(u8).empty;
     defer resp_buf.deinit(allocator);
@@ -2582,7 +2582,7 @@ test "resp large response grows buffers" {
     var bulk_ok = false;
     var attempt: usize = 0;
     while (attempt < 200 and !bulk_ok) : (attempt += 1) {
-        const n = try stream.reader().read(&tmp);
+        const n = try stream.read(&tmp);
         if (n == 0) break;
         try resp_buf.appendSlice(allocator, tmp[0..n]);
         const data = resp_buf.items;
@@ -2618,17 +2618,17 @@ test "resp ops commands return pong and stats" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("*1\r\n$4\r\nPING\r\n");
+    try stream.writeAll("*1\r\n$4\r\nPING\r\n");
     var buf: [1024]u8 = undefined;
-    var n = try stream.reader().read(&buf);
+    var n = try stream.read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "+PONG") != null);
 
-    try stream.writer().writeAll("*1\r\n$4\r\nINFO\r\n");
-    n = try stream.reader().read(&buf);
+    try stream.writeAll("*1\r\n$4\r\nINFO\r\n");
+    n = try stream.read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "cache.items") != null);
 
-    try stream.writer().writeAll("*1\r\n$5\r\nSTATS\r\n");
-    n = try stream.reader().read(&buf);
+    try stream.writeAll("*1\r\n$5\r\nSTATS\r\n");
+    n = try stream.read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "cache.items") != null);
 }
 
@@ -2651,13 +2651,13 @@ test "resp monitor streams commands and closes on non-ping" {
     var monitor = try connectRetry(harness.server.address());
     defer monitor.close();
 
-    try monitor.writer().writeAll("*1\r\n$7\r\nMONITOR\r\n");
+    try monitor.writeAll("*1\r\n$7\r\nMONITOR\r\n");
     var ok_buf: [64]u8 = undefined;
     var ok_used: usize = 0;
     var ok_found = false;
     var attempt: usize = 0;
     while (attempt < 5 and ok_used < ok_buf.len) : (attempt += 1) {
-        const n = try monitor.reader().read(ok_buf[ok_used..]);
+        const n = try monitor.read(ok_buf[ok_used..]);
         if (n == 0) break;
         ok_used += n;
         if (std.mem.indexOf(u8, ok_buf[0..ok_used], "+OK\r\n") != null) {
@@ -2669,9 +2669,9 @@ test "resp monitor streams commands and closes on non-ping" {
 
     var client = try connectRetry(harness.server.address());
     defer client.close();
-    try client.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    try client.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
     var client_buf: [128]u8 = undefined;
-    _ = try client.reader().read(&client_buf);
+    _ = try client.read(&client_buf);
 
     var monitor_buf = std.ArrayList(u8).empty;
     defer monitor_buf.deinit(allocator);
@@ -2679,7 +2679,7 @@ test "resp monitor streams commands and closes on non-ping" {
     var seen = false;
     attempt = 0;
     while (attempt < 20 and !seen) : (attempt += 1) {
-        const n = try monitor.reader().read(&tmp);
+        const n = try monitor.read(&tmp);
         if (n == 0) break;
         try monitor_buf.appendSlice(allocator, tmp[0..n]);
         const data = monitor_buf.items;
@@ -2693,13 +2693,13 @@ test "resp monitor streams commands and closes on non-ping" {
 
     var monitor2 = try connectRetry(harness.server.address());
     defer monitor2.close();
-    try monitor2.writer().writeAll("*1\r\n$7\r\nMONITOR\r\n");
+    try monitor2.writeAll("*1\r\n$7\r\nMONITOR\r\n");
     var ok2_buf: [64]u8 = undefined;
     var ok2_used: usize = 0;
     var ok2_found = false;
     attempt = 0;
     while (attempt < 5 and ok2_used < ok2_buf.len) : (attempt += 1) {
-        const n = try monitor2.reader().read(ok2_buf[ok2_used..]);
+        const n = try monitor2.read(ok2_buf[ok2_used..]);
         if (n == 0) break;
         ok2_used += n;
         if (std.mem.indexOf(u8, ok2_buf[0..ok2_used], "+OK\r\n") != null) {
@@ -2709,11 +2709,11 @@ test "resp monitor streams commands and closes on non-ping" {
     }
     try std.testing.expect(ok2_found);
 
-    try monitor2.writer().writeAll("*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
+    try monitor2.writeAll("*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
     var closed = false;
     attempt = 0;
     while (attempt < 10) : (attempt += 1) {
-        const n = try monitor2.reader().read(&tmp);
+        const n = try monitor2.read(&tmp);
         if (n == 0) {
             closed = true;
             break;
@@ -2741,12 +2741,12 @@ test "resp malformed request returns error and closes" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("*2\r\n$3\r\nGET\r\n$4\r\nshort\r\n");
+    try stream.writeAll("*2\r\n$3\r\nGET\r\n$4\r\nshort\r\n");
     var buf: [256]u8 = undefined;
-    const n = try stream.reader().read(&buf);
+    const n = try stream.read(&buf);
     try std.testing.expect(n > 0);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "-ERR") != null);
-    const n2 = try stream.reader().read(&buf);
+    const n2 = try stream.read(&buf);
     try std.testing.expect(n2 == 0);
 }
 
@@ -2775,9 +2775,9 @@ test "concurrent connections" {
             fn run(address: std.net.Address) void {
                 var stream = std.net.tcpConnectToAddress(address) catch return;
                 defer stream.close();
-                stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch return;
+                stream.writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n") catch return;
                 var buf: [128]u8 = undefined;
-                _ = stream.reader().read(&buf) catch return;
+                _ = stream.read(&buf) catch return;
             }
         }.run, .{bound});
     }
@@ -2804,7 +2804,7 @@ test "metrics snapshot tracks requests and bytes" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writer().writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream.writeAll("GET /k HTTP/1.1\r\nConnection: close\r\n\r\n");
     var buf: [256]u8 = undefined;
     _ = try readHttpResponse(&stream, &buf);
 
@@ -2842,16 +2842,19 @@ test "pool exhaustion increments pool_full" {
     var stream1 = try connectRetry(harness.server.address());
     var stream1_closed = false;
     defer if (!stream1_closed) stream1.close();
-    try stream1.writer().writeAll("GET /a HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+    try stream1.writeAll("GET /a HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
     var buf: [256]u8 = undefined;
     _ = try readHttpResponse(&stream1, &buf);
     std.Thread.sleep(5 * std.time.ns_per_ms);
 
     var stream2 = try connectRetry(harness.server.address());
     defer stream2.close();
-    try stream2.writer().writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream2.writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
     var buf2: [128]u8 = undefined;
-    const n = try stream2.reader().read(&buf2);
+    const n = stream2.read(&buf2) catch |err| switch (err) {
+        error.ConnectionResetByPeer => 0,
+        else => return err,
+    };
     if (n > 0) {
         try std.testing.expect(std.mem.indexOf(u8, buf2[0..n], "HTTP/1.1") == null);
     }
@@ -2888,13 +2891,13 @@ test "threaded server dispatches across workers" {
     const bound = harness.server.address();
     var stream1 = try connectRetry(bound);
     defer stream1.close();
-    try stream1.writer().writeAll("GET /a HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream1.writeAll("GET /a HTTP/1.1\r\nConnection: close\r\n\r\n");
     var buf: [256]u8 = undefined;
     _ = try readHttpResponse(&stream1, &buf);
 
     var stream2 = try connectRetry(bound);
     defer stream2.close();
-    try stream2.writer().writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try stream2.writeAll("GET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
     _ = try readHttpResponse(&stream2, &buf);
 
     std.Thread.sleep(10 * std.time.ns_per_ms);
