@@ -480,3 +480,44 @@ test "resp parser handles SAVE and LOAD" {
     try std.testing.expectEqualStrings("snap.cruc", res.ok.command.load.path.?);
     try std.testing.expect(res.ok.command.load.fast);
 }
+
+test "resp parser error cases" {
+    var parser = Parser.init(.{ .max_args = 1, .max_key_length = 1, .max_value_length = 1 });
+
+    var res = parser.parse("", true);
+    try std.testing.expect(res == .err);
+    try std.testing.expectEqual(Error.ConnectionClosed, res.err);
+
+    res = parser.parse("PING", false);
+    try std.testing.expect(res == .err);
+    try std.testing.expectEqual(Error.MalformedRequest, res.err);
+
+    res = parser.parse("*2\r\n$3\r\nGET\r\n$1\r\na\r\n", false);
+    try std.testing.expect(res == .err);
+    try std.testing.expectEqual(Error.TooManyArgs, res.err);
+
+    res = parser.parse("*x\r\n", false);
+    try std.testing.expect(res == .err);
+    try std.testing.expectEqual(Error.InvalidNumber, res.err);
+
+    var parser2 = Parser.init(.{ .max_key_length = 1, .max_value_length = 1, .max_args = 32 });
+    res = parser2.parse("*2\r\n$3\r\nGET\r\n$2\r\naa\r\n", false);
+    try std.testing.expect(res == .err);
+    try std.testing.expectEqual(Error.ValueTooLarge, res.err);
+}
+
+test "resp build command rejects invalid options" {
+    const limits = Limits{ .max_key_length = 3, .max_value_length = 3, .max_args = 32 };
+    const args_nx_xx = [_][]const u8{ "SET", "k", "v", "NX", "XX" };
+    try std.testing.expectError(Error.MalformedRequest, buildCommand(args_nx_xx[0..], limits));
+
+    const args_missing_ttl = [_][]const u8{ "SET", "k", "v", "EX" };
+    try std.testing.expectError(Error.MalformedRequest, buildCommand(args_missing_ttl[0..], limits));
+
+    const args_invalid_ttl = [_][]const u8{ "SET", "k", "v", "EX", "nope" };
+    try std.testing.expectError(Error.InvalidNumber, buildCommand(args_invalid_ttl[0..], limits));
+
+    const small_limits = Limits{ .max_key_length = 1, .max_value_length = 3, .max_args = 32 };
+    const args_big_key = [_][]const u8{ "GET", "aa" };
+    try std.testing.expectError(Error.ValueTooLarge, buildCommand(args_big_key[0..], small_limits));
+}

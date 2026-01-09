@@ -37,6 +37,17 @@ pub const StartStatus = enum {
 
 pub const CompletionFn = *const fn (ctx: *anyopaque, ok: bool) void;
 
+const CompletionState = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    ok: std.atomic.Value(bool) = .init(false),
+};
+
+fn recordCompletion(ctx: *anyopaque, ok: bool) void {
+    const state = @as(*CompletionState, @ptrCast(@alignCast(ctx)));
+    state.ok.store(ok, .release);
+    state.done.store(true, .release);
+}
+
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     cache: *cache_mod.api.Cache,
@@ -869,6 +880,59 @@ fn syncParentDir(path: []const u8) !void {
         .DQUOT => return error.DiskQuota,
         else => return error.Unexpected,
     }
+}
+
+test "persistence manager disabled and busy states" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache_mod.engine.deinit(cache);
+
+    var state = CompletionState{};
+
+    var disabled = Manager.init(allocator, cache, null);
+    try std.testing.expectEqual(StartStatus.disabled, disabled.startSave(null, false, &state, recordCompletion));
+
+    var empty = Manager.init(allocator, cache, "");
+    try std.testing.expectEqual(StartStatus.disabled, empty.startLoad(null, false, &state, recordCompletion));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "snap.busy",
+    });
+    defer allocator.free(path);
+
+    state.done.store(false, .release);
+    state.ok.store(false, .release);
+
+    var mgr = Manager.init(allocator, cache, path);
+    try std.testing.expectEqual(StartStatus.ok, mgr.startSave(null, true, &state, recordCompletion));
+    try std.testing.expectEqual(StartStatus.busy_save, mgr.startSave(null, true, &state, recordCompletion));
+
+    mgr.waitForIdle();
+    mgr.drainPendingPath();
+    try std.testing.expect(state.done.load(.acquire));
+    try std.testing.expect(state.ok.load(.acquire));
+}
+
+test "persistence manager drains pending path" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache_mod.engine.deinit(cache);
+
+    var mgr = Manager.init(allocator, cache, "snap.pending");
+    const pending = try allocator.dupe(u8, "pending");
+    mgr.pending_path = pending;
+    mgr.drainPendingPath();
+    try std.testing.expect(mgr.pending_path == null);
 }
 
 test "snapshot preserves cas when enabled" {

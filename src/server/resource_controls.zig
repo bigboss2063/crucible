@@ -168,3 +168,23 @@ test "autosweep removes expired entries" {
     autosweepTick(cache);
     try std.testing.expectEqual(@as(usize, 5), cache_mod.engine.count(cache, .{}));
 }
+
+test "resource controls rss parsing" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rss = try processRssBytes(std.heap.pageSize());
+    try std.testing.expect(rss > 0);
+}
+
+test "resource controls start and stop memory monitor" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache_mod.engine.deinit(cache);
+
+    var controls = ResourceControls.init(1, false, false);
+    try controls.start(cache);
+    controls.stop();
+    try std.testing.expect(controls.mem_thread == null);
+}

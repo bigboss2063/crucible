@@ -289,3 +289,111 @@ test "map resize and shrink" {
     try map.tryShrink();
     try std.testing.expectEqual(@as(usize, 4), map.nbuckets);
 }
+
+test "map invalid capacity" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(MapError.InvalidCapacity, Map.init(allocator, 0, .{}));
+    try std.testing.expectError(MapError.InvalidCapacity, Map.init(allocator, 3, .{}));
+}
+
+test "map insert swap and shift delete" {
+    const allocator = std.testing.allocator;
+    var map = try Map.init(allocator, 8, .{});
+    defer map.deinit();
+
+    const e1 = try entry.create(allocator, "alpha", "one", .{});
+    const e2 = try entry.create(allocator, "beta", "two", .{});
+    const e3 = try entry.create(allocator, "gamma", "three", .{});
+    const h0: u32 = 0;
+    const h1: u32 = 1;
+
+    try std.testing.expect((try map.insert(e1, h0)) == null);
+    try std.testing.expect((try map.insert(e2, h1)) == null);
+    try std.testing.expect((try map.insert(e3, h0)) == null);
+
+    const removed1 = map.delete("alpha", h0).?;
+    defer entry.release(removed1, allocator);
+    const removed2 = map.delete("beta", h1).?;
+    defer entry.release(removed2, allocator);
+    const removed3 = map.delete("gamma", h0).?;
+    defer entry.release(removed3, allocator);
+}
+
+test "map tryShrink recalculates desired" {
+    const allocator = std.testing.allocator;
+    var map = try Map.init(allocator, 4, .{ .allow_shrink = true, .shrink_factor = 100 });
+    defer map.deinit();
+
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    var i: usize = 0;
+    while (i < keys.len) : (i += 1) {
+        const key = keys[i];
+        const ent = try entry.create(allocator, key, "v", .{});
+        const hash = @as(u32, @truncate(@import("hash.zig").th64(key, 0)));
+        _ = try map.insert(ent, hash);
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), map.nbuckets);
+
+    const hash0 = @as(u32, @truncate(@import("hash.zig").th64(keys[0], 0)));
+    const removed0 = map.delete(keys[0], hash0).?;
+    defer entry.release(removed0, allocator);
+
+    try map.tryShrink();
+    try std.testing.expectEqual(@as(usize, 8), map.nbuckets);
+
+    var j: usize = 1;
+    while (j < keys.len) : (j += 1) {
+        const key = keys[j];
+        const hash = @as(u32, @truncate(@import("hash.zig").th64(key, 0)));
+        const removed = map.delete(key, hash).?;
+        defer entry.release(removed, allocator);
+    }
+}
+
+test "map resize rehash swap" {
+    const allocator = std.testing.allocator;
+    var map = try Map.init(allocator, 4, .{});
+    defer map.deinit();
+
+    const e1 = try entry.create(allocator, "alpha", "one", .{});
+    const e2 = try entry.create(allocator, "beta", "two", .{});
+    const e3 = try entry.create(allocator, "gamma", "three", .{});
+    defer entry.release(e1, allocator);
+    defer entry.release(e2, allocator);
+    defer entry.release(e3, allocator);
+
+    map.count = 3;
+    map.total = 3;
+    map.entsize = entry.memSize(e1) + entry.memSize(e2) + entry.memSize(e3);
+
+    map.buckets[0] = bucket.init();
+    bucket.setPtr(entry.Entry, &map.buckets[0], e1);
+    bucket.writeHash(&map.buckets[0], 0);
+    map.buckets[0].dib = 1;
+
+    map.buckets[1] = bucket.init();
+    bucket.setPtr(entry.Entry, &map.buckets[1], e2);
+    bucket.writeHash(&map.buckets[1], 1);
+    map.buckets[1].dib = 1;
+
+    map.buckets[2] = bucket.init();
+    bucket.setPtr(entry.Entry, &map.buckets[2], e3);
+    bucket.writeHash(&map.buckets[2], 0);
+    map.buckets[2].dib = 1;
+
+    map.buckets[3] = bucket.init();
+
+    try map.resize(8);
+    try std.testing.expectEqual(@as(usize, 8), map.nbuckets);
+}
+
+test "map entryEqual handles sixpack mismatch" {
+    const allocator = std.testing.allocator;
+    const packed_entry = try entry.create(allocator, "abcd", "one", .{});
+    const raw = try entry.create(allocator, "abcd", "two", .{ .nosixpack = true });
+    defer entry.release(packed_entry, allocator);
+    defer entry.release(raw, allocator);
+
+    try std.testing.expect(entryEqual(packed_entry, raw, false));
+}

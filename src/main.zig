@@ -533,3 +533,50 @@ test "parse args help" {
     const opts = try parseArgs(&[_][]const u8{"--help"});
     try std.testing.expect(opts.show_help);
 }
+
+test "parse listen ipv6" {
+    const addr = try parseListen("[::1]:6380");
+    const expected = try std.net.Address.parseIp("::1", 6380);
+    try std.testing.expect(std.net.Address.eql(expected, addr));
+}
+
+test "parse maxmemory raw and tb" {
+    const sysmem: u64 = 1_000_000;
+    try std.testing.expectEqual(@as(?u64, 4096), try parseMaxMemory("4096", sysmem));
+    try std.testing.expectEqual(@as(?u64, 1 * 1024 * 1024 * 1024 * 1024), try parseMaxMemory("1tb", sysmem));
+}
+
+test "parse bool invalid returns null" {
+    try std.testing.expect(parseBool("maybe") == null);
+}
+
+test "parse args network tuning" {
+    const opts = try parseArgs(&[_][]const u8{
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "6381",
+        "--protocol",
+        "auto",
+        "--protocol",
+        "http",
+        "--maxconns",
+        "100",
+        "--backlog",
+        "64",
+        "--queuesize",
+        "512",
+        "--keepalive-ms",
+        "5000",
+        "--maxmemory",
+        "1tb",
+    });
+    const expected = try std.net.Address.parseIp("127.0.0.1", 6381);
+    try std.testing.expect(std.net.Address.eql(expected, opts.address));
+    try std.testing.expectEqual(crucible.server.network.Protocol.http, opts.protocol);
+    try std.testing.expectEqual(@as(usize, 100), opts.max_connections);
+    try std.testing.expectEqual(@as(u31, 64), opts.backlog);
+    try std.testing.expectEqual(@as(u32, 512), opts.loop_entries);
+    try std.testing.expectEqual(@as(u64, 5000), opts.keepalive_ms);
+    try std.testing.expectEqual(@as(?u64, 1 * 1024 * 1024 * 1024 * 1024), opts.maxmemory_bytes);
+}

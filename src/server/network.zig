@@ -447,6 +447,116 @@ fn appendHexByte(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: 
     try list.append(allocator, hex[value & 0xF]);
 }
 
+test "monitor queue push pop and clear" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var queue = try MonitorQueue.init(allocator, 2);
+    defer queue.deinit(allocator);
+
+    const payload1 = try allocator.dupe(u8, "a");
+    const payload2 = try allocator.dupe(u8, "b");
+    try std.testing.expect(queue.push(.{ .payload = payload1 }));
+    try std.testing.expect(queue.push(.{ .payload = payload2 }));
+
+    const payload3 = try allocator.dupe(u8, "c");
+    if (!queue.push(.{ .payload = payload3 })) {
+        allocator.free(payload3);
+    }
+
+    clearMonitorQueue(&queue, allocator);
+    try std.testing.expect(queue.pop() == null);
+}
+
+test "monitor line formatting escapes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = [_][]const u8{ "a\nb", "c\rd", "e\tf", "g\"h", "i\\j", "\xff" };
+    const line = try formatMonitorLine(allocator, "127.0.0.1:1", args[0..]);
+    defer allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "127.0.0.1:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\xFF") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\r\n"));
+}
+
+test "metrics helpers aggregate and snapshot" {
+    const errors = ErrorCounts{
+        .accept = 1,
+        .read = 2,
+        .write = 3,
+        .parse = 4,
+        .protocol = 5,
+        .pool_full = 6,
+        .buffer_overflow = 7,
+        .cache = 8,
+        .timeout = 9,
+    };
+    var dst_errors = ErrorCounts{};
+    addErrorCounts(&dst_errors, errors);
+    try std.testing.expectEqual(errors.accept, dst_errors.accept);
+    try std.testing.expectEqual(errors.timeout, dst_errors.timeout);
+
+    var dst_metrics = Metrics{
+        .active_connections = 1,
+        .total_connections = 2,
+        .total_requests = 3,
+        .total_responses = 4,
+        .bytes_read = 5,
+        .bytes_written = 6,
+        .errors = .{ .accept = 1 },
+    };
+    const src_metrics = Metrics{
+        .active_connections = 10,
+        .total_connections = 20,
+        .total_requests = 30,
+        .total_responses = 40,
+        .bytes_read = 50,
+        .bytes_written = 60,
+        .errors = errors,
+    };
+    addMetrics(&dst_metrics, src_metrics);
+    try std.testing.expectEqual(@as(usize, 11), dst_metrics.active_connections);
+    try std.testing.expectEqual(@as(u64, 22), dst_metrics.total_connections);
+    try std.testing.expectEqual(@as(u64, 33), dst_metrics.total_requests);
+    try std.testing.expectEqual(@as(u64, 44), dst_metrics.total_responses);
+    try std.testing.expectEqual(@as(u64, 55), dst_metrics.bytes_read);
+    try std.testing.expectEqual(@as(u64, 66), dst_metrics.bytes_written);
+    try std.testing.expectEqual(@as(u64, 2), dst_metrics.errors.accept);
+
+    var atomic = AtomicMetrics.init();
+    addUsize(&atomic.active_connections, 2);
+    subUsize(&atomic.active_connections, 1);
+    addU64(&atomic.total_connections, 3);
+    addU64(&atomic.total_requests, 4);
+    addU64(&atomic.total_responses, 5);
+
+    const snap = atomic.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), snap.active_connections);
+    try std.testing.expectEqual(@as(u64, 3), snap.total_connections);
+    try std.testing.expectEqual(@as(u64, 4), snap.total_requests);
+    try std.testing.expectEqual(@as(u64, 5), snap.total_responses);
+
+    const snap2 = snapshotAtomic(@ptrCast(&atomic));
+    try std.testing.expectEqual(@as(usize, 1), snap2.active_connections);
+
+    var batch = MetricsBatch{ .requests = 2, .responses = 3 };
+    var ctx: ServerContext = undefined;
+    ctx.metrics = &atomic;
+    ctx.metrics_batch = &batch;
+    flushMetricsBatch(&ctx);
+    try std.testing.expectEqual(@as(u64, 6), atomic.total_requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 8), atomic.total_responses.load(.monotonic));
+}
+
 fn startMetricsFlush(ctx: *ServerContext) void {
     if (metrics_flush_interval_ms == 0) return;
     ctx.metrics_timer.run(ctx.loop, ctx.metrics_timer_completion, metrics_flush_interval_ms, ServerContext, ctx, onMetricsFlush);

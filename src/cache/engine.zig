@@ -1441,3 +1441,94 @@ test "eviction chooses oldest of two when no expired" {
         entry_handle.release();
     }
 }
+
+test "count total size oneshard" {
+    const cache = try init(.{
+        .allocator = std.testing.allocator,
+        .nshards = 1,
+    });
+    defer deinit(cache);
+
+    try std.testing.expectEqual(api.StoreResult.Inserted, try store(cache, "k1", "v1", .{}));
+    try std.testing.expectEqual(api.StoreResult.Inserted, try store(cache, "k2", "v2", .{}));
+
+    try std.testing.expectEqual(@as(usize, 2), count(cache, .{ .oneshard = true, .oneshardidx = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), count(cache, .{ .oneshard = true, .oneshardidx = 1 }));
+
+    try std.testing.expectEqual(@as(u64, 2), total(cache, .{ .oneshard = true, .oneshardidx = 0 }));
+    try std.testing.expectEqual(@as(u64, 0), total(cache, .{ .oneshard = true, .oneshardidx = 1 }));
+
+    const size0 = size(cache, .{ .oneshard = true, .oneshardidx = 0 });
+    const size_entries = size(cache, .{ .oneshard = true, .oneshardidx = 0, .entriesonly = true });
+    try std.testing.expect(size0 > 0);
+    try std.testing.expect(size_entries > 0);
+    try std.testing.expectEqual(@as(usize, 0), size(cache, .{ .oneshard = true, .oneshardidx = 1 }));
+}
+
+test "iter deletes and stops" {
+    const cache = try init(.{
+        .allocator = std.testing.allocator,
+        .nshards = 1,
+    });
+    defer deinit(cache);
+
+    try std.testing.expectEqual(api.StoreResult.Inserted, try store(cache, "a", "1", .{}));
+    try std.testing.expectEqual(api.StoreResult.Inserted, try store(cache, "b", "2", .{}));
+
+    const IterCtx = struct {
+        seen: usize = 0,
+    };
+    var ctx = IterCtx{};
+
+    const res = iter(cache, .{
+        .entry = (struct {
+            fn apply(
+                _: u32,
+                _: i64,
+                _: []const u8,
+                _: []const u8,
+                _: i64,
+                _: u32,
+                _: u64,
+                udata: ?*anyopaque,
+            ) api.IterAction {
+                const state = @as(*IterCtx, @ptrCast(@alignCast(udata.?)));
+                state.seen += 1;
+                return api.IterAction.StopDelete;
+            }
+        }).apply,
+        .udata = &ctx,
+    });
+    try std.testing.expectEqual(api.IterResult.Canceled, res);
+    try std.testing.expectEqual(@as(usize, 1), ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), count(cache, .{}));
+
+    try std.testing.expectEqual(api.IterResult.Finished, iter(cache, .{ .oneshard = true, .oneshardidx = 1 }));
+}
+
+test "entry iter cursor out of range" {
+    const cache = try init(.{
+        .allocator = std.testing.allocator,
+        .nshards = 1,
+    });
+    defer deinit(cache);
+
+    var cursor: u64 = @as(u64, 2) << 32;
+    try std.testing.expect(entryIter(cache, 0, &cursor) == null);
+    try std.testing.expectEqual(@as(u64, 0), cursor);
+}
+
+test "clear oneshard deferfree" {
+    const cache = try init(.{
+        .allocator = std.testing.allocator,
+        .nshards = 1,
+    });
+    defer deinit(cache);
+
+    try std.testing.expectEqual(api.StoreResult.Inserted, try store(cache, "k", "v", .{}));
+    clear(cache, .{ .time = 10, .oneshard = true, .oneshardidx = 0, .deferfree = true });
+    try std.testing.expectEqual(@as(usize, 0), count(cache, .{}));
+
+    clear(cache, .{ .oneshard = true, .oneshardidx = 1 });
+    try std.testing.expectEqual(@as(usize, 0), count(cache, .{}));
+}

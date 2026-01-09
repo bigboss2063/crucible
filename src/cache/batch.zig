@@ -159,3 +159,38 @@ test "thread local batch reuse across threads" {
     try std.testing.expect(ctxs[0].first != 0 and ctxs[1].first != 0);
     try std.testing.expect(ctxs[0].first != ctxs[1].first);
 }
+
+test "batch begin detects reentrant in debug" {
+    if (@import("builtin").mode != .Debug) return error.SkipZigTest;
+
+    var cache = Cache{
+        .allocator = std.testing.allocator,
+        .yield = null,
+        .udata = null,
+        .usethreadbatch = true,
+        .shards = &.{},
+    };
+
+    const batch = try begin(&cache);
+    defer end(batch);
+    try std.testing.expectError(error.BatchReentrant, begin(&cache));
+}
+
+test "batch lock links shard and releases" {
+    var shard = try shard_mod.Shard.init(std.testing.allocator, 8, .{});
+    defer shard.deinit();
+
+    var cache = Cache{
+        .allocator = std.testing.allocator,
+        .yield = null,
+        .udata = null,
+        .usethreadbatch = false,
+        .shards = &.{},
+    };
+
+    const batch = try begin(&cache);
+    lock(batch, &shard, null, null);
+    try std.testing.expect(batch.shard != null);
+    end(batch);
+    try std.testing.expectEqual(@as(usize, 0), @atomicLoad(usize, &shard.lock, .acquire));
+}

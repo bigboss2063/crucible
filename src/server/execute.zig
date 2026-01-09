@@ -720,3 +720,246 @@ test "resp execution rejects writes when lowmem and eviction disabled" {
     );
     try std.testing.expectEqualStrings("-ERR out of memory\r\n", rb.readable());
 }
+
+test "http execution delete ops not found and stats" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var rb = try buffer.LinearBuffer.init(allocator, 512);
+    defer rb.deinit();
+
+    _ = try cache_mod.engine.store(cache_instance, "k", "v", .{});
+    _ = try executeHttp(cache_instance, .{ .delete = .{ .key = "k" } }, null, false, &rb, true, null);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "200") != null);
+
+    rb.clear();
+    _ = try executeHttp(cache_instance, .{ .ops_not_found = {} }, null, false, &rb, true, null);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "404") != null);
+
+    rb.clear();
+    const snapshot = stats.StatsSnapshot{
+        .time_unix_ms = 1,
+        .uptime_ms = 1,
+        .server = .{
+            .active_connections = 0,
+            .total_connections = 1,
+            .total_requests = 2,
+            .total_responses = 3,
+            .bytes_read = 4,
+            .bytes_written = 5,
+        },
+        .errors = .{
+            .accept = 0,
+            .read = 0,
+            .write = 0,
+            .parse = 0,
+            .protocol = 0,
+            .pool_full = 0,
+            .buffer_overflow = 0,
+            .cache = 0,
+            .timeout = 0,
+        },
+        .cache = .{
+            .items = 0,
+            .total_items = 0,
+            .bytes = 0,
+            .shards = 1,
+        },
+    };
+    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, &rb, true, snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "200") != null);
+
+    rb.clear();
+    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, &rb, true, null);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "500") != null);
+}
+
+test "http execution rejects lowmem writes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var controls = resource_controls.ResourceControls.init(null, false, false);
+    controls.lowmem.store(true, .release);
+
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
+    defer rb.deinit();
+
+    _ = try executeHttp(
+        cache_instance,
+        .{ .set = .{ .key = "k", .value = "v", .xx = false } },
+        &controls,
+        false,
+        &rb,
+        true,
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "ERR out of memory") != null);
+}
+
+test "resp execution delete decr expire ttl branches" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
+    defer rb.deinit();
+
+    _ = try cache_mod.engine.store(cache_instance, "k", "v", .{});
+    _ = try executeResp(cache_instance, .{ .delete = .{ .key = "k" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":1\r\n", rb.readable());
+
+    rb.clear();
+    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":-1\r\n", rb.readable());
+
+    rb.clear();
+    _ = try executeResp(
+        cache_instance,
+        .{ .expire = .{ .key = "missing", .ttl_ns = @as(i64, @intCast(5 * std.time.ns_per_s)) } },
+        null,
+        &rb,
+        true,
+        null,
+    );
+    try std.testing.expectEqualStrings(":0\r\n", rb.readable());
+
+    _ = try cache_mod.engine.store(cache_instance, "expire", "v", .{});
+    rb.clear();
+    _ = try executeResp(
+        cache_instance,
+        .{ .expire = .{ .key = "expire", .ttl_ns = @as(i64, @intCast(5 * std.time.ns_per_s)) } },
+        null,
+        &rb,
+        true,
+        null,
+    );
+    try std.testing.expectEqualStrings(":1\r\n", rb.readable());
+
+    _ = try cache_mod.engine.store(cache_instance, "ttl", "v", .{});
+    rb.clear();
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "ttl" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":-1\r\n", rb.readable());
+
+    const now_time = cache_mod.engine.now();
+    _ = try cache_mod.engine.store(cache_instance, "expired", "v", .{ .expires = now_time - 1 });
+    rb.clear();
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "expired" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":-2\r\n", rb.readable());
+
+    _ = try cache_mod.engine.store(
+        cache_instance,
+        "live",
+        "v",
+        .{ .expires = now_time + @as(i64, @intCast(5 * std.time.ns_per_s)) },
+    );
+    rb.clear();
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "live" } }, null, &rb, true, null);
+    const ttl_out = rb.readable();
+    try std.testing.expect(ttl_out.len >= 3);
+    try std.testing.expect(ttl_out[0] == ':');
+    try std.testing.expect(ttl_out[ttl_out.len - 2] == '\r' and ttl_out[ttl_out.len - 1] == '\n');
+    const ttl_val = try std.fmt.parseInt(i64, ttl_out[1 .. ttl_out.len - 2], 10);
+    try std.testing.expect(ttl_val >= 0);
+}
+
+test "resp execution info missing snapshot and lowmem incr" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
+    defer rb.deinit();
+
+    _ = try executeResp(cache_instance, .{ .info = {} }, null, &rb, true, null);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "ERR internal error") != null);
+
+    rb.clear();
+    var controls = resource_controls.ResourceControls.init(null, false, false);
+    controls.lowmem.store(true, .release);
+    const res = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, &controls, &rb, true, null);
+    try std.testing.expect(res.cache_error);
+    try std.testing.expect(std.mem.indexOf(u8, rb.readable(), "ERR out of memory") != null);
+}
+
+test "resp execution incr updates existing value" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    _ = try cache_mod.engine.store(cache_instance, "counter", "10", .{});
+
+    var rb = try buffer.LinearBuffer.init(allocator, 128);
+    defer rb.deinit();
+
+    _ = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":11\r\n", rb.readable());
+
+    rb.clear();
+    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, &rb, true, null);
+    try std.testing.expectEqualStrings(":10\r\n", rb.readable());
+
+    const entry_handle = (try cache_mod.engine.load(cache_instance, "counter", .{})) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer entry_handle.release();
+    try std.testing.expectEqualStrings("10", entry_handle.value());
+}
+
+test "resp execution info returns snapshot" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var rb = try buffer.LinearBuffer.init(allocator, 256);
+    defer rb.deinit();
+
+    const snapshot = stats.StatsSnapshot{
+        .time_unix_ms = 1,
+        .uptime_ms = 2,
+        .server = .{
+            .active_connections = 3,
+            .total_connections = 4,
+            .total_requests = 5,
+            .total_responses = 6,
+            .bytes_read = 7,
+            .bytes_written = 8,
+        },
+        .errors = .{
+            .accept = 0,
+            .read = 0,
+            .write = 0,
+            .parse = 0,
+            .protocol = 0,
+            .pool_full = 0,
+            .buffer_overflow = 0,
+            .cache = 0,
+            .timeout = 0,
+        },
+        .cache = .{
+            .items = 1,
+            .total_items = 2,
+            .bytes = 3,
+            .shards = 4,
+        },
+    };
+
+    _ = try executeResp(cache_instance, .{ .info = {} }, null, &rb, true, snapshot);
+    const out = rb.readable();
+    try std.testing.expect(std.mem.indexOf(u8, out, "server.total_connections:4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cache.items:1") != null);
+}

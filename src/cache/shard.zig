@@ -143,3 +143,43 @@ test "shard lock excludes concurrent access" {
     try std.testing.expectEqual(@as(u64, 4 * state.iterations), state.counter.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.violations.load(.acquire));
 }
+
+test "shard lock yields under contention" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var shard = try Shard.init(std.testing.allocator, 8, .{});
+    defer shard.deinit();
+
+    const YieldCtx = struct {
+        yielded: std.atomic.Value(bool) = .init(false),
+        started: std.atomic.Value(bool) = .init(false),
+    };
+    var ctx = YieldCtx{};
+
+    const yield_fn = struct {
+        fn call(udata: ?*anyopaque) void {
+            const state = @as(*YieldCtx, @ptrCast(@alignCast(udata.?)));
+            state.yielded.store(true, .release);
+            _ = std.Thread.yield() catch {};
+        }
+    }.call;
+
+    shard.lockExclusive(null, null);
+
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run(target: *Shard, state: *YieldCtx, yield: ?api.YieldFn) void {
+            state.started.store(true, .release);
+            target.lockExclusive(yield, @ptrCast(state));
+            target.unlock();
+        }
+    }.run, .{ &shard, &ctx, yield_fn });
+
+    while (!ctx.started.load(.acquire)) {
+        _ = std.Thread.yield() catch {};
+    }
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    shard.unlock();
+    worker.join();
+
+    try std.testing.expect(ctx.yielded.load(.acquire));
+}

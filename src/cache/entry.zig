@@ -277,3 +277,17 @@ test "entry raw key without sixpack" {
     try std.testing.expectEqualStrings("hello!", raw);
     try std.testing.expectEqualStrings("ok", value(entry, false));
 }
+
+test "entry large payload uses u32 size field" {
+    const allocator = std.testing.allocator;
+    const value_len: usize = 70_000;
+    const value_buf = try allocator.alloc(u8, value_len);
+    defer allocator.free(value_buf);
+    @memset(value_buf, 'a');
+
+    const entry_ptr = try create(allocator, "bigkey", value_buf, .{});
+    defer release(entry_ptr, allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), memSizeFieldLen(entry_ptr));
+    try std.testing.expect(memSize(entry_ptr) >= @sizeOf(Entry));
+}
