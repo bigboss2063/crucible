@@ -1,6 +1,6 @@
 # Crucible
 
-[![coverage](https://codecov.io/gh/bigboss2063/crucible/branch/main/graph/badge.svg)](https://codecov.io/gh/bigboss2063/crucible)
+[![coverage](https://codecov.io/gh/bigboss2063/crucible/branch/main/graph/badge.svg)](https://codecov.io/gh/bigboss2063/crucible) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/bigboss2063/crucible)
 
 Crucible is an embedded cache storage engine written in Zig with an optional server layer for HTTP and RESP (Valkey/Redis) protocols.
 The built-in server uses libxev (io_uring on Linux, kqueue on macOS).
