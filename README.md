@@ -4,6 +4,7 @@
 
 Crucible is an embedded cache storage engine written in Zig with an optional server layer for HTTP and RESP (Valkey/Redis) protocols.
 The built-in server uses libxev (io_uring on Linux, kqueue on macOS).
+Inspired by [Pogocache](https://github.com/tidwall/pogocache).
 
 ## Architecture
 
@@ -23,6 +24,18 @@ The built-in server uses libxev (io_uring on Linux, kqueue on macOS).
 - Callbacks for eviction/notify and load/update hooks.
 - Incremental protocol parsing with buffer reuse on the hot path.
 - Built-in metrics and snapshot persistence endpoints.
+
+## Why Zig
+
+- Manual memory management and no GC pauses for predictable latency.
+- Precise control over memory layout and alignment for packed data structures.
+- Safety checks in Debug/ReleaseSafe with C-like performance in ReleaseFast.
+- Simple C interop and easy embedding in systems stacks.
+- Portable builds for Linux and macOS with a single toolchain.
+
+## Benchmarks
+
+See `BENCHMARKS.md` for machine details, configuration, parameters, and full results.
 
 ## Defaults and Limits
 
@@ -45,7 +58,7 @@ Server defaults (binary):
 - Max connections: 10,000 (buffers are preallocated)
 - Backlog: 128
 - Event loop entries: 256
-- Read/write buffers: 16KB initial, grow on demand
+- Read buffer: 16KB initial, grow on demand; output buffer: 16KB inline + 16KB chunk queue (grows on demand)
 - Keepalive: 60s
 - Max memory: 80% of system memory (RSS-based); eviction and autosweep enabled
   by default; `--maxmemory unlimited` disables eviction

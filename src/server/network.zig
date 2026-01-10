@@ -2,9 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev").Dynamic;
 const cache = @import("../cache/mod.zig");
-const buffer = @import("buffer.zig");
 const connection = @import("connection.zig");
 const execute = @import("execute.zig");
+const output_buffer = @import("output_buffer.zig");
 const persistence = @import("persistence.zig");
 const resource_controls = @import("resource_controls.zig");
 const stats = @import("stats.zig");
@@ -21,7 +21,6 @@ pub const Protocol = enum {
 pub const Limits = comptime_parser.Limits;
 
 const default_read_buffer_bytes: usize = 16 * 1024;
-const default_write_buffer_bytes: usize = 16 * 1024;
 const default_request_bytes: usize = 1024 * 1024;
 
 pub const ServerOptions = struct {
@@ -39,6 +38,7 @@ pub const ServerOptions = struct {
     maxmemory_bytes: ?u64 = null,
     evict: bool = true,
     autosweep: bool = true,
+    output_limits: output_buffer.OutputLimit = .{},
 };
 
 pub const ErrorCounts = struct {
@@ -391,8 +391,9 @@ fn deliverMonitorLine(ctx: *ServerContext, line: []const u8) void {
             monitorUnregister(conn, ctx);
             continue;
         }
-        const out = selectWriteBuffer(conn);
-        if (!writeAll(out, true, line)) {
+        const writer = &conn.output;
+        if (!writeAll(writer, line)) {
+            handleOutputOverflow(conn, ctx);
             closeConnection(conn, ctx);
             continue;
         }
@@ -768,8 +769,10 @@ pub const Server = struct {
             opts.allocator,
             opts.max_connections,
             default_read_buffer_bytes,
-            default_write_buffer_bytes,
+            output_buffer.default_inline_bytes,
+            output_buffer.default_chunk_bytes,
             limits,
+            opts.output_limits,
         );
         errdefer pool.deinit();
 
@@ -1125,12 +1128,6 @@ fn processIncoming(conn: *connection.Connection, ctx: *ServerContext) void {
     }
 }
 
-fn selectWriteBuffer(conn: *connection.Connection) *buffer.LinearBuffer {
-    if (conn.write_in_progress) return &conn.pending_write_buf;
-    if (conn.pending_write_buf.readable().len != 0) return &conn.pending_write_buf;
-    return &conn.write_buf;
-}
-
 fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: http.Command) void {
     switch (cmd) {
         .save => |save_cmd| {
@@ -1152,17 +1149,16 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
         },
         else => {},
     }
+    const writer = &conn.output;
     const result = execute.executeHttp(
         ctx.cache,
         cmd,
         ctx.resource_controls,
         conn.keepalive,
-        selectWriteBuffer(conn),
-        true,
+        writer,
         snapshot,
     ) catch {
-        addU64(&ctx.metrics.errors.buffer_overflow, 1);
-        conn.closing = true;
+        handleOutputOverflow(conn, ctx);
         return;
     };
     if (result.cache_error) addU64(&ctx.metrics.errors.cache, 1);
@@ -1175,9 +1171,9 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
     if (conn.monitoring) {
         switch (cmd) {
             .ping => {
-                const out = selectWriteBuffer(conn);
-                if (!writeRespSimple(out, true, "PONG")) {
-                    addU64(&ctx.metrics.errors.buffer_overflow, 1);
+                const writer = &conn.output;
+                if (!writeRespSimple(writer, "PONG")) {
+                    handleOutputOverflow(conn, ctx);
                     closeConnection(conn, ctx);
                     return;
                 }
@@ -1193,9 +1189,9 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
 
     if (cmd == .monitor) {
         if (!monitorRegister(conn, ctx)) {
-            const out = selectWriteBuffer(conn);
-            if (!writeRespError(out, true, "ERR monitor unavailable")) {
-                addU64(&ctx.metrics.errors.buffer_overflow, 1);
+            const writer = &conn.output;
+            if (!writeRespError(writer, "ERR monitor unavailable")) {
+                handleOutputOverflow(conn, ctx);
                 closeConnection(conn, ctx);
                 return;
             }
@@ -1203,10 +1199,10 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
             queueWrite(conn, ctx);
             return;
         }
-        const out = selectWriteBuffer(conn);
-        if (!writeRespSimple(out, true, "OK")) {
+        const writer = &conn.output;
+        if (!writeRespSimple(writer, "OK")) {
             monitorUnregister(conn, ctx);
-            addU64(&ctx.metrics.errors.buffer_overflow, 1);
+            handleOutputOverflow(conn, ctx);
             closeConnection(conn, ctx);
             return;
         }
@@ -1235,16 +1231,15 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
         },
         else => {},
     }
+    const writer = &conn.output;
     const result = execute.executeResp(
         ctx.cache,
         cmd,
         ctx.resource_controls,
-        selectWriteBuffer(conn),
-        true,
+        writer,
         snapshot,
     ) catch {
-        addU64(&ctx.metrics.errors.buffer_overflow, 1);
-        conn.closing = true;
+        handleOutputOverflow(conn, ctx);
         return;
     };
     if (result.cache_error) addU64(&ctx.metrics.errors.cache, 1);
@@ -1262,8 +1257,7 @@ fn handlePersistCommand(
     const allocator = ctx.options.allocator;
     const notify = allocator.create(PersistNotify) catch {
         if (!writePersistFailure(conn, ctx, "ERR persistence failed", 500, "Internal Server Error")) {
-            addU64(&ctx.metrics.errors.buffer_overflow, 1);
-            conn.closing = true;
+            handleOutputOverflow(conn, ctx);
         }
         return false;
     };
@@ -1294,8 +1288,7 @@ fn handlePersistCommand(
             conn.persist_close_after = false;
             allocator.destroy(notify);
             if (!writePersistFailure(conn, ctx, "ERR path not provided", 400, "Bad Request")) {
-                addU64(&ctx.metrics.errors.buffer_overflow, 1);
-                conn.closing = true;
+                handleOutputOverflow(conn, ctx);
             }
         },
         .busy_save => {
@@ -1303,8 +1296,7 @@ fn handlePersistCommand(
             conn.persist_close_after = false;
             allocator.destroy(notify);
             if (!writePersistFailure(conn, ctx, "ERR save already in progress", 409, "Conflict")) {
-                addU64(&ctx.metrics.errors.buffer_overflow, 1);
-                conn.closing = true;
+                handleOutputOverflow(conn, ctx);
             }
         },
         .busy_load => {
@@ -1312,8 +1304,7 @@ fn handlePersistCommand(
             conn.persist_close_after = false;
             allocator.destroy(notify);
             if (!writePersistFailure(conn, ctx, "ERR load already in progress", 409, "Conflict")) {
-                addU64(&ctx.metrics.errors.buffer_overflow, 1);
-                conn.closing = true;
+                handleOutputOverflow(conn, ctx);
             }
         },
         .failed => {
@@ -1321,8 +1312,7 @@ fn handlePersistCommand(
             conn.persist_close_after = false;
             allocator.destroy(notify);
             if (!writePersistFailure(conn, ctx, "ERR persistence failed", 500, "Internal Server Error")) {
-                addU64(&ctx.metrics.errors.buffer_overflow, 1);
-                conn.closing = true;
+                handleOutputOverflow(conn, ctx);
             }
         },
     }
@@ -1336,10 +1326,10 @@ fn writePersistFailure(
     http_code: u16,
     http_reason: []const u8,
 ) bool {
-    const out = selectWriteBuffer(conn);
+    const writer = &conn.output;
     const wrote = switch (conn.protocol) {
-        .http => writeHttpResponse(out, true, http_code, http_reason, conn.keepalive),
-        .resp => writeRespError(out, true, resp_msg),
+        .http => writeHttpResponse(writer, http_code, http_reason, conn.keepalive),
+        .resp => writeRespError(writer, resp_msg),
         .unknown => false,
     };
     if (!wrote) return false;
@@ -1371,22 +1361,21 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
         return;
     }
 
-    const out = selectWriteBuffer(conn);
+    const writer = &conn.output;
     const wrote = switch (conn.protocol) {
         .http => if (ok)
-            writeHttpResponseWithBody(out, true, 200, "OK", "OK", conn.keepalive)
+            writeHttpResponseWithBody(writer, 200, "OK", "OK", conn.keepalive)
         else
-            writeHttpResponse(out, true, 500, "Internal Server Error", conn.keepalive),
+            writeHttpResponse(writer, 500, "Internal Server Error", conn.keepalive),
         .resp => if (ok)
-            writeRespSimple(out, true, "OK")
+            writeRespSimple(writer, "OK")
         else
-            writeRespError(out, true, "ERR persistence failed"),
+            writeRespError(writer, "ERR persistence failed"),
         .unknown => false,
     };
 
     if (!wrote) {
-        addU64(&ctx.metrics.errors.buffer_overflow, 1);
-        conn.closing = true;
+        handleOutputOverflow(conn, ctx);
         conn.persist_state = .idle;
         conn.persist_close_after = false;
         return;
@@ -1419,20 +1408,31 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
     }
 }
 
+fn handleOutputOverflow(conn: *connection.Connection, ctx: *ServerContext) void {
+    addU64(&ctx.metrics.errors.buffer_overflow, 1);
+    conn.closing = true;
+    if (conn.output.limit_exceeded and !conn.write_in_progress) {
+        conn.output.dropQueued();
+        closeConnection(conn, ctx);
+    }
+}
+
 fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
     if (conn.defer_writes) return;
     if (conn.write_in_progress) return;
-    if (conn.write_buf.readable().len == 0 and conn.pending_write_buf.readable().len != 0) {
-        std.mem.swap(buffer.LinearBuffer, &conn.write_buf, &conn.pending_write_buf);
-    }
-    const slice = conn.write_buf.readable();
-    if (slice.len == 0) {
-        if (conn.closing) closeConnection(conn, ctx);
+    if (conn.output.limit_exceeded) {
+        conn.output.dropQueued();
+        closeConnection(conn, ctx);
         return;
     }
+    const write_slice = conn.output.nextWriteSlice() orelse {
+        if (conn.closing) closeConnection(conn, ctx);
+        return;
+    };
     conn.write_in_progress = true;
     conn.write_token = conn.generation;
-    const write_buf = xev.WriteBuffer{ .slice = slice };
+    conn.write_source = write_slice.source;
+    const write_buf = xev.WriteBuffer{ .slice = write_slice.slice };
     conn.tcp.write(ctx.loop, &conn.write_completion, write_buf, connection.Connection, conn, onWrite);
 }
 
@@ -1459,8 +1459,16 @@ fn onWrite(
     };
 
     conn.write_in_progress = false;
-    conn.write_buf.consume(written);
+    if (conn.write_source) |source| {
+        conn.output.consumeWrite(source, written);
+    }
+    conn.write_source = null;
     addU64(&ctx.metrics.bytes_written, @as(u64, @intCast(written)));
+    if (conn.output.limit_exceeded) {
+        conn.output.dropQueued();
+        closeConnection(conn, ctx);
+        return .disarm;
+    }
     if (conn.persist_state == .idle) {
         resetKeepalive(conn, ctx);
     }
@@ -1551,9 +1559,9 @@ fn writeHttpBadRequest(conn: *connection.Connection, ctx: *ServerContext) bool {
 }
 
 fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, reason: []const u8) bool {
-    const out = selectWriteBuffer(conn);
-    if (!writeHttpResponse(out, true, code, reason, false)) {
-        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+    const writer = &conn.output;
+    if (!writeHttpResponse(writer, code, reason, false)) {
+        handleOutputOverflow(conn, ctx);
         closeConnection(conn, ctx);
         return false;
     }
@@ -1562,9 +1570,9 @@ fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, 
 }
 
 fn writeRespErrorResponse(conn: *connection.Connection, ctx: *ServerContext, msg: []const u8) bool {
-    const out = selectWriteBuffer(conn);
-    if (!writeRespError(out, true, msg)) {
-        addU64(&ctx.metrics.errors.buffer_overflow, 1);
+    const writer = &conn.output;
+    if (!writeRespError(writer, msg)) {
+        handleOutputOverflow(conn, ctx);
         closeConnection(conn, ctx);
         return false;
     }
@@ -1643,8 +1651,7 @@ fn closeTcpImmediate(tcp: xev.TCP) void {
 }
 
 fn writeHttpResponseWithBody(
-    out: *buffer.LinearBuffer,
-    allow_resize: bool,
+    writer: anytype,
     code: u16,
     reason: []const u8,
     body: []const u8,
@@ -1657,13 +1664,11 @@ fn writeHttpResponseWithBody(
         "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
         .{ code, reason, body.len, conn },
     ) catch return false;
-    if (!ensureWritable(out, allow_resize, header.len + body.len)) return false;
-    appendUnchecked(out, header);
-    appendUnchecked(out, body);
-    return true;
+    if (!writeAll(writer, header)) return false;
+    return writeAll(writer, body);
 }
 
-fn writeHttpResponse(out: *buffer.LinearBuffer, allow_resize: bool, code: u16, reason: []const u8, keepalive: bool) bool {
+fn writeHttpResponse(writer: anytype, code: u16, reason: []const u8, keepalive: bool) bool {
     var header_buf: [256]u8 = undefined;
     const conn = if (keepalive) "keep-alive" else "close";
     const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: {s}\r\n\r\n", .{
@@ -1671,46 +1676,24 @@ fn writeHttpResponse(out: *buffer.LinearBuffer, allow_resize: bool, code: u16, r
         reason,
         conn,
     }) catch return false;
-    return writeAll(out, allow_resize, header);
+    return writeAll(writer, header);
 }
 
-fn writeRespSimple(out: *buffer.LinearBuffer, allow_resize: bool, msg: []const u8) bool {
-    if (!ensureWritable(out, allow_resize, 1 + msg.len + 2)) return false;
-    appendUnchecked(out, "+");
-    appendUnchecked(out, msg);
-    appendUnchecked(out, "\r\n");
-    return true;
+fn writeRespSimple(writer: anytype, msg: []const u8) bool {
+    if (!writeAll(writer, "+")) return false;
+    if (!writeAll(writer, msg)) return false;
+    return writeAll(writer, "\r\n");
 }
 
-fn writeRespError(out: *buffer.LinearBuffer, allow_resize: bool, msg: []const u8) bool {
-    if (!ensureWritable(out, allow_resize, 1 + msg.len + 2)) return false;
-    appendUnchecked(out, "-");
-    appendUnchecked(out, msg);
-    appendUnchecked(out, "\r\n");
-    return true;
+fn writeRespError(writer: anytype, msg: []const u8) bool {
+    if (!writeAll(writer, "-")) return false;
+    if (!writeAll(writer, msg)) return false;
+    return writeAll(writer, "\r\n");
 }
 
-fn ensureWritable(out: *buffer.LinearBuffer, allow_resize: bool, len: usize) bool {
-    if (len == 0) return true;
-    if (allow_resize) {
-        if (!out.reserve(len)) return false;
-    } else {
-        if (out.availableTail() < len) return false;
-    }
-    return true;
-}
-
-fn appendUnchecked(out: *buffer.LinearBuffer, data: []const u8) void {
-    if (data.len == 0) return;
-    std.debug.assert(out.availableTail() >= data.len);
-    std.mem.copyForwards(u8, out.tailSlice()[0..data.len], data);
-    out.commitWrite(data.len);
-}
-
-fn writeAll(out: *buffer.LinearBuffer, allow_resize: bool, data: []const u8) bool {
+fn writeAll(writer: anytype, data: []const u8) bool {
     if (data.len == 0) return true;
-    if (!ensureWritable(out, allow_resize, data.len)) return false;
-    appendUnchecked(out, data);
+    writer.writeAll(data) catch return false;
     return true;
 }
 
@@ -1815,8 +1798,10 @@ const Worker = struct {
             allocator,
             pool_size,
             default_read_buffer_bytes,
-            default_write_buffer_bytes,
+            output_buffer.default_inline_bytes,
+            output_buffer.default_chunk_bytes,
             limits,
+            options.output_limits,
         );
         errdefer pool.deinit();
 
@@ -2628,15 +2613,45 @@ test "resp end-to-end and pipeline" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    try stream.writeAll("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+    const value_len: usize = 1024;
+    const value = try allocator.alloc(u8, value_len);
+    defer allocator.free(value);
+    @memset(value, 'a');
+
+    var header_buf: [128]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &header_buf,
+        "*3\r\n$3\r\nSET\r\n$1\r\na\r\n${d}\r\n",
+        .{value_len},
+    );
+    try stream.writeAll(header);
+    try stream.writeAll(value);
+    try stream.writeAll("\r\n");
     var buf: [256]u8 = undefined;
-    var n = try stream.read(&buf);
+    const n = try stream.read(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "+OK") != null);
 
-    try stream.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
-    n = try stream.read(&buf);
-    const out = buf[0..n];
-    try std.testing.expect(std.mem.count(u8, out, "$1\r\n1\r\n") == 2);
+    const pipeline: usize = 32;
+    var i: usize = 0;
+    while (i < pipeline) : (i += 1) {
+        try stream.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    }
+
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(allocator);
+
+    var tmp: [4096]u8 = undefined;
+    var seen: usize = 0;
+    var attempt: usize = 0;
+    var resp_header_buf: [32]u8 = undefined;
+    const resp_header = try std.fmt.bufPrint(&resp_header_buf, "${d}\r\n", .{value_len});
+    while (attempt < 200 and seen < pipeline) : (attempt += 1) {
+        const read_n = try stream.read(&tmp);
+        if (read_n == 0) break;
+        try resp_buf.appendSlice(allocator, tmp[0..read_n]);
+        seen = std.mem.count(u8, resp_buf.items, resp_header);
+    }
+    try std.testing.expectEqual(pipeline, seen);
 }
 
 test "resp large response grows buffers" {
@@ -2658,7 +2673,7 @@ test "resp large response grows buffers" {
     var stream = try connectRetry(harness.server.address());
     defer stream.close();
 
-    const value_len = default_read_buffer_bytes + 1024;
+    const value_len = output_buffer.default_inline_bytes + 1024;
     const value = try allocator.alloc(u8, value_len);
     defer allocator.free(value);
     @memset(value, 'a');
@@ -2779,27 +2794,29 @@ test "resp monitor streams commands and closes on non-ping" {
 
     var client = try connectRetry(harness.server.address());
     defer client.close();
-    try client.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    const monitor_requests: usize = 8;
+    var req_idx: usize = 0;
+    while (req_idx < monitor_requests) : (req_idx += 1) {
+        try client.writeAll("*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    }
     var client_buf: [128]u8 = undefined;
     _ = try client.read(&client_buf);
 
     var monitor_buf = std.ArrayList(u8).empty;
     defer monitor_buf.deinit(allocator);
     var tmp: [256]u8 = undefined;
-    var seen = false;
+    var seen: usize = 0;
     attempt = 0;
-    while (attempt < 20 and !seen) : (attempt += 1) {
+    while (attempt < 50 and seen < monitor_requests) : (attempt += 1) {
         const n = try monitor.read(&tmp);
         if (n == 0) break;
         try monitor_buf.appendSlice(allocator, tmp[0..n]);
         const data = monitor_buf.items;
-        if (std.mem.indexOf(u8, data, "\"GET\" \"a\"") != null and
-            std.mem.indexOf(u8, data, "[0 127.0.0.1:") != null)
-        {
-            seen = true;
+        if (std.mem.indexOf(u8, data, "[0 127.0.0.1:") != null) {
+            seen = std.mem.count(u8, data, "\"GET\" \"a\"");
         }
     }
-    try std.testing.expect(seen);
+    try std.testing.expect(seen >= monitor_requests);
 
     var monitor2 = try connectRetry(harness.server.address());
     defer monitor2.close();
