@@ -251,6 +251,7 @@ const MonitorHub = struct {
 };
 
 const metrics_flush_interval_ms: u64 = 50;
+const output_limit_check_interval_ns: u64 = std.time.ns_per_s;
 
 fn flushMetricsBatch(ctx: *ServerContext) void {
     const batch = ctx.metrics_batch.drain();
@@ -575,8 +576,26 @@ fn onMetricsFlush(
         return .disarm;
     };
     flushMetricsBatch(ctx);
+    checkOutputLimits(ctx);
     startMetricsFlush(ctx);
     return .disarm;
+}
+
+fn checkOutputLimits(ctx: *ServerContext) void {
+    if (ctx.options.output_limits.soft_bytes == 0 or ctx.options.output_limits.soft_seconds == 0) return;
+    const now = std.time.Instant.now() catch return;
+    if (ctx.output_limit_last) |last| {
+        if (now.since(last) < output_limit_check_interval_ns) return;
+    }
+    ctx.output_limit_last = now;
+
+    for (ctx.pool.conns) |*conn| {
+        if (conn.in_pool or conn.close_done or conn.close_queued or conn.closing) continue;
+        if (conn.output.limit_exceeded or !conn.output.hasPending()) continue;
+        if (conn.output.pollSoftLimit(now)) {
+            handleOutputOverflow(conn, ctx);
+        }
+    }
 }
 
 fn configureSocket(tcp: xev.TCP, is_unix: bool) bool {
@@ -677,6 +696,7 @@ const ServerContext = struct {
     metrics_batch: *MetricsBatch,
     metrics_timer: *xev.Timer,
     metrics_timer_completion: *xev.Completion,
+    output_limit_last: ?std.time.Instant,
     monitor_registry: *MonitorRegistry,
     monitor_queue: ?*MonitorQueue,
     monitor_overflow: ?*AtomicBool,
@@ -840,6 +860,7 @@ pub const Server = struct {
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
             .metrics_timer_completion = &self.metrics_timer_completion,
+            .output_limit_last = null,
             .monitor_registry = &self.monitor_registry,
             .monitor_queue = null,
             .monitor_overflow = null,
@@ -1853,6 +1874,7 @@ const Worker = struct {
             .metrics_batch = &self.metrics_batch,
             .metrics_timer = &self.metrics_timer,
             .metrics_timer_completion = &self.metrics_timer_completion,
+            .output_limit_last = null,
             .monitor_registry = &self.monitor_registry,
             .monitor_queue = &self.monitor_queue,
             .monitor_overflow = &self.monitor_overflow,

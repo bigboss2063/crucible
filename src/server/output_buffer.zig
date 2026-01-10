@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const OutputLimit = struct {
     hard_bytes: usize = 0,
@@ -291,24 +292,40 @@ pub const OutputBuffer = struct {
             return;
         }
 
+        const now = std.time.Instant.now() catch return;
+        if (self.checkSoftLimitAt(now)) {
+            return error.OutputLimitExceeded;
+        }
+    }
+
+    pub fn pollSoftLimit(self: *OutputBuffer, now: std.time.Instant) bool {
+        if (self.limit_exceeded) return true;
+        return self.checkSoftLimitAt(now);
+    }
+
+    fn checkSoftLimitAt(self: *OutputBuffer, now: std.time.Instant) bool {
+        if (self.limits.soft_bytes == 0 or self.limits.soft_seconds == 0) {
+            self.soft_since = null;
+            return false;
+        }
+
         if (self.queued_bytes <= self.limits.soft_bytes) {
             self.soft_since = null;
-            return;
+            return false;
         }
 
         if (self.soft_since == null) {
-            const now = std.time.Instant.now() catch return;
             self.soft_since = now;
-            return;
+            return false;
         }
 
-        const now = std.time.Instant.now() catch return;
         const elapsed_ns = now.since(self.soft_since.?);
         const threshold = @as(u64, self.limits.soft_seconds) * std.time.ns_per_s;
         if (elapsed_ns >= threshold) {
             self.limit_exceeded = true;
-            return error.OutputLimitExceeded;
+            return true;
         }
+        return false;
     }
 
     fn updateSoftState(self: *OutputBuffer) void {
@@ -370,9 +387,68 @@ test "output buffer soft limit clears on drain" {
     defer buf.deinit();
 
     try buf.append("hello");
-    try std.testing.expect(buf.queued_bytes == 5);
     const slice = buf.nextWriteSlice().?;
     buf.consumeWrite(slice.source, slice.slice.len);
-    try std.testing.expect(buf.queued_bytes == 0);
-    try std.testing.expect(buf.soft_since == null);
+    try std.testing.expect(!buf.hasPending());
+    const later = advanceInstant(std.time.Instant.now() catch unreachable, std.time.ns_per_s * 2);
+    try std.testing.expect(!buf.pollSoftLimit(later));
+}
+
+test "output buffer poll soft limit triggers after threshold" {
+    var buf = try OutputBuffer.init(std.testing.allocator, 8, 8, .{ .soft_bytes = 4, .soft_seconds = 1 });
+    defer buf.deinit();
+
+    try buf.append("hello");
+    const now = std.time.Instant.now() catch unreachable;
+    const later = advanceInstant(now, std.time.ns_per_s + 1);
+    try std.testing.expect(buf.pollSoftLimit(later));
+}
+
+test "output buffer poll soft limit does not trigger before threshold" {
+    var buf = try OutputBuffer.init(std.testing.allocator, 8, 8, .{ .soft_bytes = 4, .soft_seconds = 1 });
+    defer buf.deinit();
+
+    try buf.append("hello");
+    const now = std.time.Instant.now() catch unreachable;
+    const soon = advanceInstant(now, std.time.ns_per_s / 2);
+    try std.testing.expect(!buf.pollSoftLimit(soon));
+}
+
+test "output buffer poll soft limit clears timer when below soft limit" {
+    var buf = try OutputBuffer.init(std.testing.allocator, 8, 8, .{ .soft_bytes = 4, .soft_seconds = 1 });
+    defer buf.deinit();
+
+    try buf.append("hello");
+    const slice = buf.nextWriteSlice().?;
+    buf.consumeWrite(slice.source, 1);
+    try std.testing.expect(buf.hasPending());
+
+    const later = advanceInstant(std.time.Instant.now() catch unreachable, std.time.ns_per_s * 2);
+    try std.testing.expect(!buf.pollSoftLimit(later));
+}
+
+fn advanceInstant(base: std.time.Instant, delta_ns: u64) std.time.Instant {
+    var out = base;
+    switch (builtin.os.tag) {
+        .windows => {
+            const qpf = std.os.windows.QueryPerformanceFrequency();
+            const ticks = @as(u64, @intCast((@as(u128, delta_ns) * qpf) / std.time.ns_per_s));
+            out.timestamp = base.timestamp + ticks;
+        },
+        .uefi, .wasi => {
+            out.timestamp = base.timestamp + delta_ns;
+        },
+        else => {
+            const sec_type = @TypeOf(base.timestamp.sec);
+            const nsec_type = @TypeOf(base.timestamp.nsec);
+            const base_nsec = @as(u64, @intCast(base.timestamp.nsec));
+            const sum_nsec = base_nsec + delta_ns;
+            const carry = sum_nsec / std.time.ns_per_s;
+            const new_nsec = sum_nsec % std.time.ns_per_s;
+            const new_sec = @as(i128, @intCast(base.timestamp.sec)) + @as(i128, @intCast(carry));
+            out.timestamp.sec = @as(sec_type, @intCast(new_sec));
+            out.timestamp.nsec = @as(nsec_type, @intCast(new_nsec));
+        },
+    }
+    return out;
 }

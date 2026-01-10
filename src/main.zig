@@ -59,6 +59,9 @@ const CliOptions = struct {
     maxmemory_bytes: ?u64,
     evict: bool,
     autosweep: bool,
+    output_hard_bytes: usize,
+    output_soft_bytes: usize,
+    output_soft_seconds: u32,
     persist_path: ?[]const u8,
     unix_path: ?[]const u8,
     show_help: bool,
@@ -87,6 +90,9 @@ fn defaultOptions(sysmem: u64) ParseError!CliOptions {
         .maxmemory_bytes = maxmemory,
         .evict = true,
         .autosweep = true,
+        .output_hard_bytes = 0,
+        .output_soft_bytes = 0,
+        .output_soft_seconds = 0,
         .persist_path = null,
         .unix_path = null,
         .show_help = false,
@@ -188,6 +194,45 @@ fn suffixEquals(value: []const u8, short: []const u8, long: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value, short) or std.ascii.eqlIgnoreCase(value, long);
 }
 
+fn parseByteSize(value: []const u8) ParseError!u64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidArgs;
+
+    var end: usize = 0;
+    while (end < trimmed.len and (std.ascii.isDigit(trimmed[end]) or trimmed[end] == '.')) : (end += 1) {}
+    if (end == 0) return error.InvalidArgs;
+
+    const number = std.fmt.parseFloat(f64, trimmed[0..end]) catch return error.InvalidArgs;
+    if (!(number >= 0) or !std.math.isFinite(number)) return error.InvalidArgs;
+    const suffix = std.mem.trim(u8, trimmed[end..], " \t\r\n");
+
+    var bytes: f64 = 0;
+    if (suffix.len == 0) {
+        bytes = number;
+    } else if (suffixEquals(suffix, "k", "kb")) {
+        bytes = number * 1024.0;
+    } else if (suffixEquals(suffix, "m", "mb")) {
+        bytes = number * 1024.0 * 1024.0;
+    } else if (suffixEquals(suffix, "g", "gb")) {
+        bytes = number * 1024.0 * 1024.0 * 1024.0;
+    } else if (suffixEquals(suffix, "t", "tb")) {
+        bytes = number * 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    } else {
+        return error.InvalidArgs;
+    }
+
+    if (!(bytes >= 0) or !std.math.isFinite(bytes)) return error.InvalidArgs;
+    const max = @as(f64, @floatFromInt(std.math.maxInt(u64)));
+    if (bytes > max) return error.InvalidArgs;
+    return @as(u64, @intFromFloat(bytes));
+}
+
+fn parseByteSizeUsize(value: []const u8) ParseError!usize {
+    const bytes = try parseByteSize(value);
+    if (bytes > std.math.maxInt(usize)) return error.InvalidArgs;
+    return @as(usize, @intCast(bytes));
+}
+
 fn parseArgs(args: []const []const u8) ParseError!CliOptions {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help")) {
@@ -245,6 +290,15 @@ fn parseArgs(args: []const []const u8) ParseError!CliOptions {
         } else if (std.mem.eql(u8, arg, "--keepalive-ms")) {
             const value = try nextValue(args, &i);
             opts.keepalive_ms = try parseIntRange(u64, value, 0, std.math.maxInt(u64));
+        } else if (std.mem.eql(u8, arg, "--output-hard-bytes")) {
+            const value = try nextValue(args, &i);
+            opts.output_hard_bytes = try parseByteSizeUsize(value);
+        } else if (std.mem.eql(u8, arg, "--output-soft-bytes")) {
+            const value = try nextValue(args, &i);
+            opts.output_soft_bytes = try parseByteSizeUsize(value);
+        } else if (std.mem.eql(u8, arg, "--output-soft-seconds")) {
+            const value = try nextValue(args, &i);
+            opts.output_soft_seconds = try parseIntRange(u32, value, 0, std.math.maxInt(u32));
         } else if (std.mem.eql(u8, arg, "--shards")) {
             const value = try nextValue(args, &i);
             opts.cache_nshards = try parseIntRange(u32, value, 0, std.math.maxInt(u32));
@@ -308,6 +362,11 @@ fn printUsage(file: std.fs.File) !void {
         \\  --backlog count         accept backlog               (default: 128)
         \\  --queuesize count       event loop queue size        (default: 256)
         \\  --keepalive-ms ms       keepalive timeout            (default: 60000)
+        \\
+        \\Output buffer options:
+        \\  --output-hard-bytes n   hard output limit            (default: 0)
+        \\  --output-soft-bytes n   soft output limit            (default: 0)
+        \\  --output-soft-seconds n soft limit grace seconds     (default: 0)
         \\
         \\Cache options:
         \\  --shards count          number of shards             (default: engine)
@@ -382,6 +441,11 @@ pub fn main() !void {
         .maxmemory_bytes = opts.maxmemory_bytes,
         .evict = opts.evict,
         .autosweep = opts.autosweep,
+        .output_limits = .{
+            .hard_bytes = opts.output_hard_bytes,
+            .soft_bytes = opts.output_soft_bytes,
+            .soft_seconds = opts.output_soft_seconds,
+        },
     };
 
     if (opts.threads <= 1) {
@@ -437,6 +501,9 @@ test "parse args defaults" {
     try std.testing.expect(opts.evict);
     try std.testing.expect(opts.autosweep);
     try std.testing.expect(opts.unix_path == null);
+    try std.testing.expectEqual(@as(usize, 0), opts.output_hard_bytes);
+    try std.testing.expectEqual(@as(usize, 0), opts.output_soft_bytes);
+    try std.testing.expectEqual(@as(u32, 0), opts.output_soft_seconds);
     const sysmem = try systemMemoryBytes();
     const expected_max = @as(u64, @intFromFloat(@as(f64, @floatFromInt(sysmem)) * 0.8));
     try std.testing.expectEqual(@as(?u64, expected_max), opts.maxmemory_bytes);
@@ -461,6 +528,20 @@ test "parse args unixsocket" {
     });
     try std.testing.expect(opts.unix_path != null);
     try std.testing.expectEqualStrings("crucible.sock", opts.unix_path.?);
+}
+
+test "parse args output limits" {
+    const opts = try parseArgs(&[_][]const u8{
+        "--output-hard-bytes",
+        "64kb",
+        "--output-soft-bytes",
+        "32kb",
+        "--output-soft-seconds",
+        "5",
+    });
+    try std.testing.expectEqual(@as(usize, 64 * 1024), opts.output_hard_bytes);
+    try std.testing.expectEqual(@as(usize, 32 * 1024), opts.output_soft_bytes);
+    try std.testing.expectEqual(@as(u32, 5), opts.output_soft_seconds);
 }
 
 test "parse args cache options" {
