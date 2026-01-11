@@ -285,5 +285,6 @@ RESP commands:
 * [X]  RESP command monitoring stream via `MONITOR`.
 * [X]  Snapshot persistence with `SAVE`/`LOAD` (including `FAST` mode).
 * [ ]  Protocol compatibility: expand RESP command coverage for broader client interoperability.
+* [ ]  Server-side batch semantics: hold shard locks across multi-command batches.
 * [ ]  Persistence and recovery: periodic snapshots and incremental/WAL-based recovery.
 * [ ]  Security: TLS and auth token support.
