@@ -392,7 +392,7 @@ fn deliverMonitorLine(ctx: *ServerContext, line: []const u8) void {
             monitorUnregister(conn, ctx);
             continue;
         }
-        const writer = &conn.output;
+        const writer = &conn.write_buf;
         if (!writeAll(writer, line)) {
             handleOutputOverflow(conn, ctx);
             closeConnection(conn, ctx);
@@ -591,8 +591,8 @@ fn checkOutputLimits(ctx: *ServerContext) void {
 
     for (ctx.pool.conns) |*conn| {
         if (conn.in_pool or conn.close_done or conn.close_queued or conn.closing) continue;
-        if (conn.output.limit_exceeded or !conn.output.hasPending()) continue;
-        if (conn.output.pollSoftLimit(now)) {
+        if (conn.write_buf.limit_exceeded or !conn.write_buf.hasPending()) continue;
+        if (conn.write_buf.pollSoftLimit(now)) {
             handleOutputOverflow(conn, ctx);
         }
     }
@@ -1170,7 +1170,7 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
         },
         else => {},
     }
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     const result = execute.executeHttp(
         ctx.cache,
         cmd,
@@ -1192,7 +1192,7 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
     if (conn.monitoring) {
         switch (cmd) {
             .ping => {
-                const writer = &conn.output;
+                const writer = &conn.write_buf;
                 if (!writeRespSimple(writer, "PONG")) {
                     handleOutputOverflow(conn, ctx);
                     closeConnection(conn, ctx);
@@ -1210,7 +1210,7 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
 
     if (cmd == .monitor) {
         if (!monitorRegister(conn, ctx)) {
-            const writer = &conn.output;
+            const writer = &conn.write_buf;
             if (!writeRespError(writer, "ERR monitor unavailable")) {
                 handleOutputOverflow(conn, ctx);
                 closeConnection(conn, ctx);
@@ -1220,7 +1220,7 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
             queueWrite(conn, ctx);
             return;
         }
-        const writer = &conn.output;
+        const writer = &conn.write_buf;
         if (!writeRespSimple(writer, "OK")) {
             monitorUnregister(conn, ctx);
             handleOutputOverflow(conn, ctx);
@@ -1252,7 +1252,7 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
         },
         else => {},
     }
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     const result = execute.executeResp(
         ctx.cache,
         cmd,
@@ -1347,7 +1347,7 @@ fn writePersistFailure(
     http_code: u16,
     http_reason: []const u8,
 ) bool {
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     const wrote = switch (conn.protocol) {
         .http => writeHttpResponse(writer, http_code, http_reason, conn.keepalive),
         .resp => writeRespError(writer, resp_msg),
@@ -1382,7 +1382,7 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
         return;
     }
 
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     const wrote = switch (conn.protocol) {
         .http => if (ok)
             writeHttpResponseWithBody(writer, 200, "OK", "OK", conn.keepalive)
@@ -1432,8 +1432,8 @@ fn finishPersistResponse(conn: *connection.Connection, ctx: *ServerContext, ok: 
 fn handleOutputOverflow(conn: *connection.Connection, ctx: *ServerContext) void {
     addU64(&ctx.metrics.errors.buffer_overflow, 1);
     conn.closing = true;
-    if (conn.output.limit_exceeded and !conn.write_in_progress) {
-        conn.output.dropQueued();
+    if (conn.write_buf.limit_exceeded and !conn.write_in_progress) {
+        conn.write_buf.dropQueued();
         closeConnection(conn, ctx);
     }
 }
@@ -1441,12 +1441,12 @@ fn handleOutputOverflow(conn: *connection.Connection, ctx: *ServerContext) void 
 fn queueWrite(conn: *connection.Connection, ctx: *ServerContext) void {
     if (conn.defer_writes) return;
     if (conn.write_in_progress) return;
-    if (conn.output.limit_exceeded) {
-        conn.output.dropQueued();
+    if (conn.write_buf.limit_exceeded) {
+        conn.write_buf.dropQueued();
         closeConnection(conn, ctx);
         return;
     }
-    const write_slice = conn.output.nextWriteSlice() orelse {
+    const write_slice = conn.write_buf.nextWriteSlice() orelse {
         if (conn.closing) closeConnection(conn, ctx);
         return;
     };
@@ -1481,12 +1481,12 @@ fn onWrite(
 
     conn.write_in_progress = false;
     if (conn.write_source) |source| {
-        conn.output.consumeWrite(source, written);
+        conn.write_buf.consumeWrite(source, written);
     }
     conn.write_source = null;
     addU64(&ctx.metrics.bytes_written, @as(u64, @intCast(written)));
-    if (conn.output.limit_exceeded) {
-        conn.output.dropQueued();
+    if (conn.write_buf.limit_exceeded) {
+        conn.write_buf.dropQueued();
         closeConnection(conn, ctx);
         return .disarm;
     }
@@ -1580,7 +1580,7 @@ fn writeHttpBadRequest(conn: *connection.Connection, ctx: *ServerContext) bool {
 }
 
 fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, reason: []const u8) bool {
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     if (!writeHttpResponse(writer, code, reason, false)) {
         handleOutputOverflow(conn, ctx);
         closeConnection(conn, ctx);
@@ -1591,7 +1591,7 @@ fn writeHttpError(conn: *connection.Connection, ctx: *ServerContext, code: u16, 
 }
 
 fn writeRespErrorResponse(conn: *connection.Connection, ctx: *ServerContext, msg: []const u8) bool {
-    const writer = &conn.output;
+    const writer = &conn.write_buf;
     if (!writeRespError(writer, msg)) {
         handleOutputOverflow(conn, ctx);
         closeConnection(conn, ctx);

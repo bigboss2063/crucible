@@ -56,7 +56,7 @@ pub const Connection = struct {
     tcp: xev.TCP,
     server: ?*anyopaque,
     read_buf: buffer.LinearBuffer,
-    output: output_buffer.OutputBuffer,
+    write_buf: output_buffer.OutputBuffer,
     protocol: Protocol,
     http_parser: http.Parser,
     resp_parser: resp.Parser,
@@ -101,19 +101,19 @@ pub const Connection = struct {
     ) !Connection {
         var read_buf = try buffer.LinearBuffer.init(allocator, read_buffer_bytes);
         errdefer read_buf.deinit();
-        var output = try output_buffer.OutputBuffer.init(
+        var write_buf = try output_buffer.OutputBuffer.init(
             allocator,
             output_inline_bytes,
             output_chunk_bytes,
             output_limits,
         );
-        errdefer output.deinit();
+        errdefer write_buf.deinit();
         return .{
             .id = id,
             .tcp = undefined,
             .server = null,
             .read_buf = read_buf,
-            .output = output,
+            .write_buf = write_buf,
             .protocol = .unknown,
             .http_parser = http.Parser.init(limits),
             .resp_parser = resp.Parser.init(limits),
@@ -147,7 +147,7 @@ pub const Connection = struct {
         self.tcp = tcp;
         self.server = null;
         self.read_buf.clear();
-        self.output.reset(output_limits);
+        self.write_buf.reset(output_limits);
         self.protocol = .unknown;
         self.http_parser = http.Parser.init(limits);
         self.resp_parser = resp.Parser.init(limits);
@@ -240,7 +240,7 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *ConnectionPool) void {
         for (self.conns) |*conn| {
             conn.read_buf.deinit();
-            conn.output.deinit();
+            conn.write_buf.deinit();
         }
         self.allocator.free(self.conns);
         self.allocator.free(self.free);
@@ -263,7 +263,7 @@ pub const ConnectionPool = struct {
         if (conn.in_pool) return;
         conn.read_buf.clear();
         conn.read_buf.shrinkToInit();
-        conn.output.shrinkToInit();
+        conn.write_buf.shrinkToInit();
         conn.protocol = .unknown;
         conn.keepalive = false;
         conn.write_in_progress = false;
