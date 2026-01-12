@@ -41,6 +41,30 @@ fn evictedEntry(
     );
 }
 
+fn loadUpdate(
+    shard: u32,
+    time: i64,
+    key: []const u8,
+    value: []const u8,
+    expires: i64,
+    flags: u32,
+    cas: u64,
+    udata: ?*anyopaque,
+) ?crucible.Update {
+    _ = shard;
+    _ = time;
+    _ = cas;
+    _ = udata;
+
+    if (!std.mem.eql(u8, key, "alpha")) return null;
+
+    return .{
+        .value = value,
+        .flags = flags | 0x1,
+        .expires = expires,
+    };
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -56,18 +80,38 @@ pub fn main() !void {
     std.debug.print("nshards={d}\n", .{crucible.nshards(cache)});
 
     std.debug.print("store alpha -> {s}\n", .{@tagName(try crucible.store(cache, "alpha", "one", .{}))});
-    std.debug.print("store beta  -> {s}\n", .{@tagName(try crucible.store(cache, "beta", "two", .{}))});
+    std.debug.print("store alpha (nx) -> {s}\n", .{@tagName(try crucible.store(cache, "alpha", "one-nx", .{ .nx = true }))});
+    std.debug.print("store beta (xx) -> {s}\n", .{@tagName(try crucible.store(cache, "beta", "two", .{ .xx = true }))});
+    std.debug.print("store beta -> {s}\n", .{@tagName(try crucible.store(cache, "beta", "two", .{}))});
+
+    const cas_entry = try crucible.load(cache, "alpha", .{});
+    if (cas_entry) |entry_handle| {
+        const cas_value = entry_handle.cas();
+        entry_handle.release();
+        std.debug.print(
+            "store alpha (cas wrong) -> {s}\n",
+            .{@tagName(try crucible.store(cache, "alpha", "one-cas-bad", .{ .casop = true, .cas = cas_value + 1 }))},
+        );
+        std.debug.print(
+            "store alpha (cas ok) -> {s}\n",
+            .{@tagName(try crucible.store(cache, "alpha", "one-cas", .{ .casop = true, .cas = cas_value }))},
+        );
+    }
+
+    const updated_entry = try crucible.load(cache, "alpha", .{ .update = loadUpdate });
+    if (updated_entry) |entry_handle| {
+        defer entry_handle.release();
+        std.debug.print(
+            "load update alpha value={s} flags={d}\n",
+            .{ entry_handle.value(), entry_handle.flags() },
+        );
+    }
 
     const temp_opts = crucible.StoreOptions{
         .time = 100,
         .ttl = 10,
     };
     _ = try crucible.store(cache, "temp", "expire", temp_opts);
-
-    const batch = try crucible.begin(cache);
-    _ = try crucible.storeBatch(batch, "gamma", "three", .{});
-    _ = try crucible.storeBatch(batch, "delta", "four", .{});
-    crucible.end(batch);
 
     const iter_opts = crucible.IterOptions{
         .entry = iterEntry,
@@ -91,13 +135,23 @@ pub fn main() !void {
         std.debug.print("load temp status=NotFound\n", .{});
     }
 
-    var swept: usize = 0;
-    var kept: usize = 0;
-    const sweep_opts = crucible.SweepOptions{
-        .time = 120,
-    };
-    crucible.sweep(cache, &swept, &kept, sweep_opts);
-    std.debug.print("sweep swept={d} kept={d}\n", .{ swept, kept });
+    // Batch holds shard locks; end it before non-batch ops like count/delete.
+    {
+        const batch = try crucible.begin(cache);
+        defer crucible.end(batch);
+        _ = try crucible.storeBatch(batch, "gamma", "three", .{});
+        _ = try crucible.storeBatch(batch, "delta", "four", .{});
+        if (try crucible.loadBatch(batch, "gamma", .{})) |entry_handle| {
+            defer entry_handle.release();
+            std.debug.print("load batch gamma value={s}\n", .{entry_handle.value()});
+        }
+        std.debug.print("delete batch delta -> {s}\n", .{@tagName(crucible.deleteBatch(batch, "delta", .{}))});
+        _ = crucible.iterBatch(batch, iter_opts);
+        var swept: usize = 0;
+        var kept: usize = 0;
+        crucible.sweepBatch(batch, &swept, &kept, .{ .time = 120 });
+        std.debug.print("sweep batch swept={d} kept={d}\n", .{ swept, kept });
+    }
 
     std.debug.print(
         "count={d} total={d} size={d}\n",
