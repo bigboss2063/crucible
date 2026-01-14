@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const crucible = @import("crucible");
 const persistence = crucible.server.persistence;
+const aof = crucible.server.aof;
 
 var shutdown_signal = std.atomic.Value(bool).init(false);
 var shutdown_exit = std.atomic.Value(bool).init(false);
@@ -62,7 +63,13 @@ const CliOptions = struct {
     output_hard_bytes: usize,
     output_soft_bytes: usize,
     output_soft_seconds: u32,
-    persist_path: ?[]const u8,
+    persist_dir: []const u8,
+    dbfilename: []const u8,
+    appendonly: bool,
+    appendfilename: []const u8,
+    appendfsync: aof.AppendFsync,
+    auto_aof_rewrite_percentage: u32,
+    auto_aof_rewrite_min_size: u64,
     unix_path: ?[]const u8,
     show_help: bool,
 };
@@ -93,7 +100,13 @@ fn defaultOptions(sysmem: u64) ParseError!CliOptions {
         .output_hard_bytes = 0,
         .output_soft_bytes = 0,
         .output_soft_seconds = 0,
-        .persist_path = null,
+        .persist_dir = ".",
+        .dbfilename = "dump.rdb",
+        .appendonly = false,
+        .appendfilename = "appendonly.aof",
+        .appendfsync = .everysec,
+        .auto_aof_rewrite_percentage = 100,
+        .auto_aof_rewrite_min_size = 64 * 1024 * 1024,
         .unix_path = null,
         .show_help = false,
     };
@@ -140,6 +153,13 @@ fn parseBool(value: []const u8) ?bool {
     {
         return false;
     }
+    return null;
+}
+
+fn parseAppendFsync(value: []const u8) ?aof.AppendFsync {
+    if (std.ascii.eqlIgnoreCase(value, "always")) return .always;
+    if (std.ascii.eqlIgnoreCase(value, "everysec")) return .everysec;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return .no;
     return null;
 }
 
@@ -233,6 +253,48 @@ fn parseByteSizeUsize(value: []const u8) ParseError!usize {
     return @as(usize, @intCast(bytes));
 }
 
+fn resolvePersistPath(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8) ![]u8 {
+    if (filename.len == 0) return error.InvalidArgs;
+    if (std.fs.path.isAbsolute(filename)) {
+        return try allocator.dupe(u8, filename);
+    }
+    if (dir.len == 0) return error.InvalidArgs;
+    return try std.fs.path.join(allocator, &[_][]const u8{ dir, filename });
+}
+
+fn loadPersistence(
+    allocator: std.mem.Allocator,
+    cache_instance: *crucible.Cache,
+    snapshot_path: ?[]const u8,
+    aof_path: ?[]const u8,
+    appendonly: bool,
+) !void {
+    if (appendonly) {
+        var loaded_aof = false;
+        if (aof_path) |path| {
+            loaded_aof = true;
+            _ = aof.replay(allocator, cache_instance, path) catch |err| {
+                if (err == error.FileNotFound) {
+                    loaded_aof = false;
+                } else {
+                    return err;
+                }
+            };
+        }
+        if (!loaded_aof) {
+            if (snapshot_path) |path| {
+                _ = persistence.loadSnapshot(allocator, cache_instance, .{ .path = path }) catch |err| {
+                    if (err != error.FileNotFound) return err;
+                };
+            }
+        }
+    } else if (snapshot_path) |path| {
+        _ = persistence.loadSnapshot(allocator, cache_instance, .{ .path = path }) catch |err| {
+            if (err != error.FileNotFound) return err;
+        };
+    }
+}
+
 fn parseArgs(args: []const []const u8) ParseError!CliOptions {
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help")) {
@@ -321,10 +383,30 @@ fn parseArgs(args: []const []const u8) ParseError!CliOptions {
         } else if (std.mem.eql(u8, arg, "--autosweep")) {
             const value = try nextValue(args, &i);
             opts.autosweep = parseBool(value) orelse return error.InvalidArgs;
-        } else if (std.mem.eql(u8, arg, "--persist")) {
+        } else if (std.mem.eql(u8, arg, "--dir")) {
             const value = try nextValue(args, &i);
             if (value.len == 0) return error.InvalidArgs;
-            opts.persist_path = value;
+            opts.persist_dir = value;
+        } else if (std.mem.eql(u8, arg, "--dbfilename")) {
+            const value = try nextValue(args, &i);
+            if (value.len == 0) return error.InvalidArgs;
+            opts.dbfilename = value;
+        } else if (std.mem.eql(u8, arg, "--appendonly")) {
+            const value = try nextValue(args, &i);
+            opts.appendonly = parseBool(value) orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--appendfilename")) {
+            const value = try nextValue(args, &i);
+            if (value.len == 0) return error.InvalidArgs;
+            opts.appendfilename = value;
+        } else if (std.mem.eql(u8, arg, "--appendfsync")) {
+            const value = try nextValue(args, &i);
+            opts.appendfsync = parseAppendFsync(value) orelse return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--auto-aof-rewrite-percentage")) {
+            const value = try nextValue(args, &i);
+            opts.auto_aof_rewrite_percentage = try parseIntRange(u32, value, 0, std.math.maxInt(u32));
+        } else if (std.mem.eql(u8, arg, "--auto-aof-rewrite-min-size")) {
+            const value = try nextValue(args, &i);
+            opts.auto_aof_rewrite_min_size = try parseByteSize(value);
         } else {
             return error.InvalidArgs;
         }
@@ -378,7 +460,13 @@ fn printUsage(file: std.fs.File) !void {
         \\  --autosweep yes/no      automatic eviction sweeps    (default: yes)
         \\
         \\Persistence options:
-        \\  --persist path          snapshot path for save/load
+        \\  --dir path              persistence directory       (default: .)
+        \\  --dbfilename name       snapshot file name          (default: dump.rdb)
+        \\  --appendonly yes/no     enable append-only file     (default: no)
+        \\  --appendfilename name   append-only file name       (default: appendonly.aof)
+        \\  --appendfsync policy    always|everysec|no          (default: everysec)
+        \\  --auto-aof-rewrite-percentage n                    (default: 100)
+        \\  --auto-aof-rewrite-min-size bytes                  (default: 64mb)
         \\  --help
         \\
     );
@@ -405,10 +493,16 @@ pub fn main() !void {
     shutdown_signal.store(false, .release);
     shutdown_exit.store(false, .release);
 
-    var persist_path: ?[]u8 = null;
-    defer if (persist_path) |path| allocator.free(path);
-    if (opts.persist_path) |path| {
-        persist_path = try allocator.dupe(u8, path);
+    var snapshot_path: ?[]u8 = null;
+    var aof_path: ?[]u8 = null;
+    defer {
+        if (snapshot_path) |path| allocator.free(path);
+        if (aof_path) |path| allocator.free(path);
+    }
+
+    snapshot_path = try resolvePersistPath(allocator, opts.persist_dir, opts.dbfilename);
+    if (opts.appendonly) {
+        aof_path = try resolvePersistPath(allocator, opts.persist_dir, opts.appendfilename);
     }
 
     const cache_instance = try crucible.init(.{
@@ -421,16 +515,19 @@ pub fn main() !void {
     });
     defer crucible.deinit(cache_instance);
 
-    if (persist_path) |path| {
-        _ = persistence.loadSnapshot(allocator, cache_instance, .{ .path = path }) catch |err| {
-            if (err != error.FileNotFound) return err;
-        };
-    }
+    try loadPersistence(allocator, cache_instance, snapshot_path, aof_path, opts.appendonly);
 
     const server_opts = crucible.server.network.ServerOptions{
         .allocator = allocator,
         .cache = cache_instance,
-        .persist_path = persist_path,
+        .persistence = .{
+            .snapshot_path = snapshot_path,
+            .appendonly = opts.appendonly,
+            .aof_path = aof_path,
+            .appendfsync = opts.appendfsync,
+            .auto_aof_rewrite_percentage = opts.auto_aof_rewrite_percentage,
+            .auto_aof_rewrite_min_size = opts.auto_aof_rewrite_min_size,
+        },
         .address = opts.address,
         .protocol = opts.protocol,
         .max_connections = opts.max_connections,
@@ -462,7 +559,7 @@ pub fn main() !void {
         if (signal_thread) |thread| {
             thread.join();
         }
-        if (persist_path) |path| {
+        if (snapshot_path) |path| {
             if (shutdown_signal.load(.acquire)) {
                 server.persistence.waitForIdle();
                 _ = try persistence.saveSnapshot(allocator, cache_instance, .{ .path = path });
@@ -481,7 +578,7 @@ pub fn main() !void {
         if (signal_thread) |thread| {
             thread.join();
         }
-        if (persist_path) |path| {
+        if (snapshot_path) |path| {
             if (shutdown_signal.load(.acquire)) {
                 server.persistence.waitForIdle();
                 _ = try persistence.saveSnapshot(allocator, cache_instance, .{ .path = path });
@@ -497,7 +594,13 @@ test "parse args defaults" {
     try std.testing.expectEqual(crucible.server.network.Protocol.auto, opts.protocol);
     try std.testing.expect(opts.threads >= 1);
     try std.testing.expectEqual(@as(usize, 10_000), opts.max_connections);
-    try std.testing.expect(opts.persist_path == null);
+    try std.testing.expectEqualStrings(".", opts.persist_dir);
+    try std.testing.expectEqualStrings("dump.rdb", opts.dbfilename);
+    try std.testing.expect(!opts.appendonly);
+    try std.testing.expectEqualStrings("appendonly.aof", opts.appendfilename);
+    try std.testing.expectEqual(aof.AppendFsync.everysec, opts.appendfsync);
+    try std.testing.expectEqual(@as(u32, 100), opts.auto_aof_rewrite_percentage);
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), opts.auto_aof_rewrite_min_size);
     try std.testing.expect(opts.evict);
     try std.testing.expect(opts.autosweep);
     try std.testing.expect(opts.unix_path == null);
@@ -595,12 +698,76 @@ test "parse maxmemory formats" {
     try std.testing.expectEqual(@as(?u64, null), try parseMaxMemory("unlimited", sysmem));
 }
 
-test "parse args persist path" {
+test "parse args persistence flags" {
     const opts = try parseArgs(&[_][]const u8{
-        "--persist",
-        "/tmp/snap.crucible",
+        "--dir",
+        "/tmp",
+        "--dbfilename",
+        "snap.rdb",
+        "--appendonly",
+        "yes",
+        "--appendfilename",
+        "append.aof",
+        "--appendfsync",
+        "always",
+        "--auto-aof-rewrite-percentage",
+        "200",
+        "--auto-aof-rewrite-min-size",
+        "8mb",
     });
-    try std.testing.expectEqualStrings("/tmp/snap.crucible", opts.persist_path.?);
+    try std.testing.expectEqualStrings("/tmp", opts.persist_dir);
+    try std.testing.expectEqualStrings("snap.rdb", opts.dbfilename);
+    try std.testing.expect(opts.appendonly);
+    try std.testing.expectEqualStrings("append.aof", opts.appendfilename);
+    try std.testing.expectEqual(aof.AppendFsync.always, opts.appendfsync);
+    try std.testing.expectEqual(@as(u32, 200), opts.auto_aof_rewrite_percentage);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), opts.auto_aof_rewrite_min_size);
+}
+
+test "load persistence prefers aof when present" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snap_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "dump.rdb",
+    });
+    defer allocator.free(snap_path);
+
+    const aof_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "appendonly.aof",
+    });
+    defer allocator.free(aof_path);
+
+    const cache_snapshot = try crucible.init(.{ .allocator = allocator, .nshards = 1 });
+    defer crucible.deinit(cache_snapshot);
+    _ = try crucible.store(cache_snapshot, "k", "snap", .{});
+    _ = try persistence.saveSnapshot(allocator, cache_snapshot, .{ .path = snap_path });
+
+    var mgr = aof.Manager.init(allocator, cache_snapshot, .{ .path = aof_path, .enabled = true });
+    try mgr.start();
+    try mgr.appendSet("k", "aof", 0, 0, 0);
+    mgr.deinit();
+
+    const cache_loaded = try crucible.init(.{ .allocator = allocator, .nshards = 1 });
+    defer crucible.deinit(cache_loaded);
+
+    try loadPersistence(allocator, cache_loaded, snap_path, aof_path, true);
+    const entry = try crucible.load(cache_loaded, "k", .{});
+    try std.testing.expect(entry != null);
+    if (entry) |handle| {
+        defer handle.release();
+        try std.testing.expectEqualStrings("aof", handle.value());
+    }
 }
 
 test "parse args invalid threads" {

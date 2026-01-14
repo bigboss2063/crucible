@@ -203,7 +203,7 @@ fn backgroundTaskMain(task: *BackgroundTask) void {
 
 const default_block_size: usize = 1024 * 1024;
 const header_magic = [_]u8{ 'C', 'R', 'U', 'C', 'I', 'B', 'L', 0 };
-const header_version: u32 = 1;
+const header_version: u32 = 2;
 const compression_lz4: u32 = 1;
 const block_tag = [_]u8{ 'C', 'R', 'U', 'C' };
 const header_len: usize = header_magic.len + 4 + 4 + 8 + 4;
@@ -272,9 +272,9 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, cache: *cache_mod.api.Cache, o
     const restore_cas = cache_mod.engine.usecas(cache) and (header.flags & flag_cas_enabled) != 0;
 
     if (opts.fast) {
-        try loadFast(allocator, cache, opts.path, header.saved_unix_ns, unix_now_ns, now_time, restore_cas, &stats);
+        try loadFast(allocator, cache, opts.path, unix_now_ns, now_time, restore_cas, &stats);
     } else {
-        try loadSingle(allocator, cache, &file, header.saved_unix_ns, unix_now_ns, now_time, restore_cas, &stats);
+        try loadSingle(allocator, cache, &file, unix_now_ns, now_time, restore_cas, &stats);
     }
 
     return stats;
@@ -367,7 +367,6 @@ fn loadSingle(
     allocator: std.mem.Allocator,
     cache: *cache_mod.api.Cache,
     reader: anytype,
-    saved_unix_ns: u64,
     unix_now_ns: u64,
     now_time: i64,
     restore_cas: bool,
@@ -397,7 +396,7 @@ fn loadSingle(
         const out_len = try lz4.decompressSafe(comp_buf, decomp_buf);
         if (out_len != decomp_len) return error.BlockMalformed;
 
-        try loadRecords(cache, decomp_buf[0..out_len], saved_unix_ns, unix_now_ns, now_time, restore_cas, stats);
+        try loadRecords(cache, decomp_buf[0..out_len], unix_now_ns, now_time, restore_cas, stats);
     }
 }
 
@@ -405,7 +404,6 @@ fn loadFast(
     allocator: std.mem.Allocator,
     cache: *cache_mod.api.Cache,
     path: []const u8,
-    saved_unix_ns: u64,
     unix_now_ns: u64,
     now_time: i64,
     restore_cas: bool,
@@ -463,7 +461,6 @@ fn loadFast(
             .blocks = blocks.items,
             .start = i,
             .step = worker_count,
-            .saved_unix_ns = saved_unix_ns,
             .unix_now_ns = unix_now_ns,
             .now_time = now_time,
             .restore_cas = restore_cas,
@@ -525,7 +522,7 @@ const BlockWriter = struct {
         self: *BlockWriter,
         key: []const u8,
         value: []const u8,
-        ttl_ns: u64,
+        expire_unix_ns: u64,
         flags: u32,
         cas: u64,
         stats: *SaveStats,
@@ -542,7 +539,7 @@ const BlockWriter = struct {
 
         try appendInt(u32, &self.buffer, @as(u32, @intCast(key.len)));
         try appendInt(u32, &self.buffer, @as(u32, @intCast(value.len)));
-        try appendInt(u64, &self.buffer, ttl_ns);
+        try appendInt(u64, &self.buffer, expire_unix_ns);
         try appendInt(u32, &self.buffer, flags);
         try appendInt(u64, &self.buffer, cas);
         self.buffer.appendSliceAssumeCapacity(key);
@@ -599,16 +596,16 @@ fn saveIterEntry(
     const ctx = @as(*SaveContext, @ptrCast(@alignCast(udata.?)));
     if (ctx.err != null) return .Stop;
 
-    var ttl_ns: u64 = 0;
+    var expire_unix_ns: u64 = 0;
     if (expires > 0) {
         if (expires <= time_value) {
             ctx.stats.skipped += 1;
             return .Continue;
         }
-        ttl_ns = @as(u64, @intCast(expires - time_value));
+        expire_unix_ns = @as(u64, @intCast(expires));
     }
 
-    ctx.writer.appendEntry(key, value, ttl_ns, flags, cas, ctx.stats) catch |err| {
+    ctx.writer.appendEntry(key, value, expire_unix_ns, flags, cas, ctx.stats) catch |err| {
         ctx.err = err;
         return .Stop;
     };
@@ -678,7 +675,6 @@ const LoadWorker = struct {
     blocks: []const BlockInfo,
     start: usize,
     step: usize,
-    saved_unix_ns: u64,
     unix_now_ns: u64,
     now_time: i64,
     restore_cas: bool,
@@ -733,7 +729,7 @@ fn loadWorkerMain(worker: *LoadWorker) void {
             return;
         }
 
-        loadRecords(worker.cache, decomp_buf.items[0..out_len], worker.saved_unix_ns, worker.unix_now_ns, worker.now_time, worker.restore_cas, &worker.stats) catch |err| {
+        loadRecords(worker.cache, decomp_buf.items[0..out_len], worker.unix_now_ns, worker.now_time, worker.restore_cas, &worker.stats) catch |err| {
             worker.err = err;
             return;
         };
@@ -743,7 +739,6 @@ fn loadWorkerMain(worker: *LoadWorker) void {
 fn loadRecords(
     cache: *cache_mod.api.Cache,
     buf: []const u8,
-    saved_unix_ns: u64,
     unix_now_ns: u64,
     now_time: i64,
     restore_cas: bool,
@@ -756,7 +751,7 @@ fn loadRecords(
         pos += 4;
         const value_len = readIntFromBuf(u32, buf[pos .. pos + 4]);
         pos += 4;
-        const ttl_ns = readIntFromBuf(u64, buf[pos .. pos + 8]);
+        const expire_unix_ns = readIntFromBuf(u64, buf[pos .. pos + 8]);
         pos += 8;
         const flags = readIntFromBuf(u32, buf[pos .. pos + 4]);
         pos += 4;
@@ -773,17 +768,14 @@ fn loadRecords(
         const value = buf[pos .. pos + value_len_usize];
         pos += value_len_usize;
 
-        if (ttl_ns > 0) {
-            const expires = std.math.add(u64, saved_unix_ns, ttl_ns) catch return error.RecordMalformed;
-            if (expires <= unix_now_ns) {
+        if (expire_unix_ns > 0) {
+            if (expire_unix_ns <= unix_now_ns) {
                 stats.skipped += 1;
                 continue;
             }
-            const remaining = expires - unix_now_ns;
-            const ttl_i64 = std.math.cast(i64, remaining) orelse return error.RecordMalformed;
             _ = try cache_mod.engine.store(cache, key, value, .{
                 .time = now_time,
-                .ttl = ttl_i64,
+                .expires = @as(i64, @intCast(expire_unix_ns)),
                 .flags = flags,
                 .restore_cas = restore_cas,
                 .cas = cas,

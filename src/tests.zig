@@ -14,6 +14,7 @@ comptime {
     _ = @import("server/execute.zig");
     _ = @import("server/mod.zig");
     _ = @import("server/network.zig");
+    _ = @import("server/aof.zig");
     _ = @import("server/persistence.zig");
     _ = @import("server/resource_controls.zig");
     _ = @import("server/protocol/comptime_parser.zig");

@@ -4,6 +4,7 @@ pub const connection = @import("connection.zig");
 pub const buffer = @import("buffer.zig");
 pub const execute = @import("execute.zig");
 pub const persistence = @import("persistence.zig");
+pub const aof = @import("aof.zig");
 
 test "xev loop init smoke" {
     const xev = @import("xev").Dynamic;

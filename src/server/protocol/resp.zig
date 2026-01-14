@@ -49,6 +49,7 @@ pub const Command = union(enum) {
     ttl: KeyCommand,
     save: PersistCommand,
     load: PersistCommand,
+    bgrewriteaof: void,
     ping: void,
     info: void,
     stats: void,
@@ -311,6 +312,10 @@ fn buildCommand(args: []const []const u8, limits: Limits) Error!Command {
         if (args[1].len > limits.max_key_length) return Error.ValueTooLarge;
         return .{ .ttl = .{ .key = args[1] } };
     }
+    if (std.ascii.eqlIgnoreCase(cmd, "BGREWRITEAOF")) {
+        if (args.len != 1) return Error.MalformedRequest;
+        return .{ .bgrewriteaof = {} };
+    }
     if (std.ascii.eqlIgnoreCase(cmd, "SAVE") or std.ascii.eqlIgnoreCase(cmd, "LOAD")) {
         const is_save = std.ascii.eqlIgnoreCase(cmd, "SAVE");
         var persist_cmd = PersistCommand{};
@@ -362,6 +367,14 @@ test "resp parser handles SET with EX" {
     const res = parser.parse(buf, false);
     try std.testing.expect(res == .ok);
     try std.testing.expectEqual(@as(i64, 10) * @as(i64, @intCast(std.time.ns_per_s)), res.ok.command.set.options.ttl_ns);
+}
+
+test "resp parser handles BGREWRITEAOF command" {
+    var parser = Parser.init(.{});
+    const buf = "*1\r\n$12\r\nBGREWRITEAOF\r\n";
+    const res = parser.parse(buf, false);
+    try std.testing.expect(res == .ok);
+    try std.testing.expect(res.ok.command == .bgrewriteaof);
 }
 
 test "resp parser handles DEL command" {

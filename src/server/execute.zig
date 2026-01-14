@@ -4,6 +4,7 @@ const http = @import("protocol/http.zig");
 const resp = @import("protocol/resp.zig");
 const stats = @import("stats.zig");
 const resource_controls = @import("resource_controls.zig");
+const aof = @import("aof.zig");
 
 pub const ExecuteError = error{
     BufferOverflow,
@@ -21,12 +22,13 @@ pub fn executeHttp(
     resource: ?*const resource_controls.ResourceControls,
     keepalive: bool,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
     stats_snapshot: ?stats.StatsSnapshot,
 ) ExecuteError!ExecResult {
     return switch (cmd) {
         .get => |get_cmd| handleHttpGet(cache, get_cmd, keepalive, writer),
-        .set => |set_cmd| handleHttpSet(cache, set_cmd, resource, keepalive, writer),
-        .delete => |del_cmd| handleHttpDelete(cache, del_cmd, keepalive, writer),
+        .set => |set_cmd| handleHttpSet(cache, set_cmd, resource, keepalive, writer, aof_mgr),
+        .delete => |del_cmd| handleHttpDelete(cache, del_cmd, keepalive, writer, aof_mgr),
         .save, .load => error.AsyncRequired,
         .health => handleHttpHealth(keepalive, writer),
         .stats => handleHttpStats(keepalive, writer, stats_snapshot),
@@ -39,21 +41,23 @@ pub fn executeResp(
     cmd: resp.Command,
     resource: ?*const resource_controls.ResourceControls,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
     stats_snapshot: ?stats.StatsSnapshot,
 ) ExecuteError!ExecResult {
     return switch (cmd) {
         .get => |get_cmd| handleRespGet(cache, get_cmd, writer),
-        .set => |set_cmd| handleRespSet(cache, set_cmd, resource, writer),
-        .delete => |del_cmd| handleRespDelete(cache, del_cmd, writer),
-        .incr => |incr_cmd| handleRespIncrDecr(cache, incr_cmd.key, 1, resource, writer),
-        .decr => |decr_cmd| handleRespIncrDecr(cache, decr_cmd.key, -1, resource, writer),
-        .expire => |expire_cmd| handleRespExpire(cache, expire_cmd, writer),
+        .set => |set_cmd| handleRespSet(cache, set_cmd, resource, writer, aof_mgr),
+        .delete => |del_cmd| handleRespDelete(cache, del_cmd, writer, aof_mgr),
+        .incr => |incr_cmd| handleRespIncrDecr(cache, incr_cmd.key, 1, resource, writer, aof_mgr),
+        .decr => |decr_cmd| handleRespIncrDecr(cache, decr_cmd.key, -1, resource, writer, aof_mgr),
+        .expire => |expire_cmd| handleRespExpire(cache, expire_cmd, writer, aof_mgr),
         .ttl => |ttl_cmd| handleRespTtl(cache, ttl_cmd, writer),
         .save, .load => error.AsyncRequired,
         .ping => handleRespPing(writer),
         .info => handleRespInfo(writer, stats_snapshot),
         .stats => handleRespInfo(writer, stats_snapshot),
         .monitor => error.AsyncRequired,
+        .bgrewriteaof => error.AsyncRequired,
     };
 }
 
@@ -83,6 +87,7 @@ fn handleHttpSet(
     resource: ?*const resource_controls.ResourceControls,
     keepalive: bool,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     const lowmem = if (resource) |controls| controls.lowmem.load(.acquire) else false;
     if (resource) |controls| {
@@ -102,6 +107,16 @@ fn handleHttpSet(
         }
         return .{ .close = !keepalive, .cache_error = true };
     };
+    if (result == .Inserted or result == .Replaced) {
+        if (aof_mgr) |mgr| {
+            if (mgr.enabled()) {
+                appendAofSet(cache, mgr, cmd.key) catch {
+                    try writeHttpError(writer, 500, "Internal Server Error", keepalive);
+                    return .{ .close = !keepalive, .cache_error = true };
+                };
+            }
+        }
+    }
     switch (result) {
         .Inserted => try writeHttpResponse(writer, 201, "Created", "", keepalive),
         .Replaced => try writeHttpResponse(writer, 200, "OK", "", keepalive),
@@ -116,8 +131,17 @@ fn handleHttpDelete(
     cmd: http.KeyCommand,
     keepalive: bool,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     const result = cache_mod.engine.delete(cache, cmd.key, .{});
+    if (aof_mgr) |mgr| {
+        if (mgr.enabled()) {
+            mgr.appendDel(cmd.key) catch {
+                try writeHttpError(writer, 500, "Internal Server Error", keepalive);
+                return .{ .close = !keepalive, .cache_error = true };
+            };
+        }
+    }
     switch (result) {
         .Deleted => try writeHttpResponse(writer, 200, "OK", "", keepalive),
         .NotFound => try writeHttpResponse(writer, 404, "Not Found", "", keepalive),
@@ -187,6 +211,7 @@ fn handleRespSet(
     cmd: resp.SetCommand,
     resource: ?*const resource_controls.ResourceControls,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     const lowmem = if (resource) |controls| controls.lowmem.load(.acquire) else false;
     if (resource) |controls| {
@@ -208,6 +233,16 @@ fn handleRespSet(
         }
         return .{ .close = false, .cache_error = true };
     };
+    if (result == .Inserted or result == .Replaced) {
+        if (aof_mgr) |mgr| {
+            if (mgr.enabled()) {
+                appendAofSet(cache, mgr, cmd.key) catch {
+                    try writeRespError(writer, "ERR persistence failed");
+                    return .{ .close = false, .cache_error = true };
+                };
+            }
+        }
+    }
     switch (result) {
         .Inserted, .Replaced => try writeRespSimple(writer, "OK"),
         .Found, .NotFound, .Canceled => try writeRespNullBulk(writer),
@@ -220,8 +255,17 @@ fn handleRespDelete(
     cache: *cache_mod.api.Cache,
     cmd: resp.KeyCommand,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     const result = cache_mod.engine.delete(cache, cmd.key, .{});
+    if (aof_mgr) |mgr| {
+        if (mgr.enabled()) {
+            mgr.appendDel(cmd.key) catch {
+                try writeRespError(writer, "ERR persistence failed");
+                return .{ .close = false, .cache_error = true };
+            };
+        }
+    }
     const val: i64 = if (result == .Deleted) 1 else 0;
     try writeRespInt(writer, val);
     return .{ .close = false };
@@ -233,10 +277,19 @@ fn handleRespIncrDecr(
     delta: i64,
     resource: ?*const resource_controls.ResourceControls,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     var cache_error = false;
     const updated = try updateCounter(cache, key, delta, resource, writer, &cache_error);
     if (updated) |val| {
+        if (aof_mgr) |mgr| {
+            if (mgr.enabled()) {
+                appendAofSet(cache, mgr, key) catch {
+                    try writeRespError(writer, "ERR persistence failed");
+                    return .{ .close = false, .cache_error = true };
+                };
+            }
+        }
         try writeRespInt(writer, val);
     }
     return .{ .close = false, .cache_error = cache_error };
@@ -342,6 +395,7 @@ fn handleRespExpire(
     cache: *cache_mod.api.Cache,
     cmd: resp.ExpireCommand,
     writer: anytype,
+    aof_mgr: ?*aof.Manager,
 ) ExecuteError!ExecResult {
     var updated: bool = false;
     const now_time = cache_mod.engine.now();
@@ -386,6 +440,17 @@ fn handleRespExpire(
     };
     if (res) |handle| {
         handle.release();
+    }
+    if (updated) {
+        if (aof_mgr) |mgr| {
+            if (mgr.enabled()) {
+                const expire_unix_ns = @as(u64, @intCast(now_time + cmd.ttl_ns));
+                mgr.appendExpire(cmd.key, expire_unix_ns) catch {
+                    try writeRespError(writer, "ERR persistence failed");
+                    return .{ .close = false, .cache_error = true };
+                };
+            }
+        }
     }
     try writeRespInt(writer, if (updated) 1 else 0);
     return .{ .close = false };
@@ -447,6 +512,18 @@ fn handleRespInfo(writer: anytype, snapshot: ?stats.StatsSnapshot) ExecuteError!
     try writeAll(writer, body);
     try writeAll(writer, "\r\n");
     return .{ .close = false };
+}
+
+fn appendAofSet(cache: *cache_mod.api.Cache, mgr: *aof.Manager, key: []const u8) !void {
+    const entry = cache_mod.engine.load(cache, key, .{ .notouch = true }) catch return error.PersistenceFailed;
+    const handle = entry orelse return error.PersistenceFailed;
+    defer handle.release();
+    const value = handle.value();
+    const flags = handle.flags();
+    const cas = handle.cas();
+    const expires = handle.expires();
+    const expire_unix_ns: u64 = if (expires > 0) @as(u64, @intCast(expires)) else 0;
+    try mgr.appendSet(key, value, flags, cas, expire_unix_ns);
 }
 
 fn buildHttpHeader(
@@ -558,13 +635,13 @@ test "http execution stores and loads" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .xx = false } }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .xx = false } }, null, false, writer, null, null);
     const res = out.items;
     try std.testing.expect(std.mem.indexOf(u8, res, "201") != null);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .get = .{ .key = "k" } }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .get = .{ .key = "k" } }, null, false, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "200") != null);
 }
 
@@ -579,7 +656,7 @@ test "http execution put missing returns 404" {
     defer out.deinit(allocator);
 
     const writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .set = .{ .key = "missing", .value = "v", .xx = true } }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .set = .{ .key = "missing", .value = "v", .xx = true } }, null, false, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "404") != null);
 }
 
@@ -594,12 +671,12 @@ test "resp execution set/get" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, writer, null, null);
     try std.testing.expectEqualStrings("+OK\r\n", out.items);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .get = .{ .key = "k" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .get = .{ .key = "k" } }, null, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "$1\r\nv\r\n") != null);
 }
 
@@ -614,16 +691,16 @@ test "resp execution honors nx/xx options" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v", .options = .{} } }, null, writer, null, null);
     out.clearRetainingCapacity();
 
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v2", .options = .{ .nx = true } } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "v2", .options = .{ .nx = true } } }, null, writer, null, null);
     try std.testing.expectEqualStrings("$-1\r\n", out.items);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .set = .{ .key = "missing", .value = "v", .options = .{ .xx = true } } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .set = .{ .key = "missing", .value = "v", .options = .{ .xx = true } } }, null, writer, null, null);
     try std.testing.expectEqualStrings("$-1\r\n", out.items);
 }
 
@@ -638,11 +715,11 @@ test "resp execution incr rejects non-integer" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "abc", .options = .{} } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .set = .{ .key = "k", .value = "abc", .options = .{} } }, null, writer, null, null);
     out.clearRetainingCapacity();
 
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .incr = .{ .key = "k" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .incr = .{ .key = "k" } }, null, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ERR value is not an integer") != null);
 }
 
@@ -657,7 +734,7 @@ test "resp execution ttl missing returns -2" {
     defer out.deinit(allocator);
 
     const writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "missing" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "missing" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":-2\r\n", out.items);
 }
 
@@ -681,6 +758,7 @@ test "resp execution rejects writes when lowmem and eviction disabled" {
         &controls,
         writer,
         null,
+        null,
     );
     try std.testing.expectEqualStrings("-ERR out of memory\r\n", out.items);
 }
@@ -697,12 +775,12 @@ test "http execution delete ops not found and stats" {
 
     _ = try cache_mod.engine.store(cache_instance, "k", "v", .{});
     var writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .delete = .{ .key = "k" } }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .delete = .{ .key = "k" } }, null, false, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "200") != null);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .ops_not_found = {} }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .ops_not_found = {} }, null, false, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "404") != null);
 
     out.clearRetainingCapacity();
@@ -736,12 +814,12 @@ test "http execution delete ops not found and stats" {
         },
     };
     writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, writer, snapshot);
+    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, writer, null, snapshot);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "200") != null);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, writer, null);
+    _ = try executeHttp(cache_instance, .{ .stats = {} }, null, false, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "500") != null);
 }
 
@@ -766,6 +844,7 @@ test "http execution rejects lowmem writes" {
         false,
         writer,
         null,
+        null,
     );
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ERR out of memory") != null);
 }
@@ -782,12 +861,12 @@ test "resp execution delete decr expire ttl branches" {
 
     _ = try cache_mod.engine.store(cache_instance, "k", "v", .{});
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .delete = .{ .key = "k" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .delete = .{ .key = "k" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":1\r\n", out.items);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":-1\r\n", out.items);
 
     out.clearRetainingCapacity();
@@ -797,6 +876,7 @@ test "resp execution delete decr expire ttl branches" {
         .{ .expire = .{ .key = "missing", .ttl_ns = @as(i64, @intCast(5 * std.time.ns_per_s)) } },
         null,
         writer,
+        null,
         null,
     );
     try std.testing.expectEqualStrings(":0\r\n", out.items);
@@ -810,20 +890,21 @@ test "resp execution delete decr expire ttl branches" {
         null,
         writer,
         null,
+        null,
     );
     try std.testing.expectEqualStrings(":1\r\n", out.items);
 
     _ = try cache_mod.engine.store(cache_instance, "ttl", "v", .{});
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "ttl" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "ttl" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":-1\r\n", out.items);
 
     const now_time = cache_mod.engine.now();
     _ = try cache_mod.engine.store(cache_instance, "expired", "v", .{ .expires = now_time - 1 });
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "expired" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "expired" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":-2\r\n", out.items);
 
     _ = try cache_mod.engine.store(
@@ -834,7 +915,7 @@ test "resp execution delete decr expire ttl branches" {
     );
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "live" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .ttl = .{ .key = "live" } }, null, writer, null, null);
     const ttl_out = out.items;
     try std.testing.expect(ttl_out.len >= 3);
     try std.testing.expect(ttl_out[0] == ':');
@@ -854,14 +935,14 @@ test "resp execution info missing snapshot and lowmem incr" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .info = {} }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .info = {} }, null, writer, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ERR internal error") != null);
 
     out.clearRetainingCapacity();
     var controls = resource_controls.ResourceControls.init(null, false, false);
     controls.lowmem.store(true, .release);
     writer = out.writer(allocator);
-    const res = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, &controls, writer, null);
+    const res = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, &controls, writer, null, null);
     try std.testing.expect(res.cache_error);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ERR out of memory") != null);
 }
@@ -879,12 +960,12 @@ test "resp execution incr updates existing value" {
     defer out.deinit(allocator);
 
     var writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .incr = .{ .key = "counter" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":11\r\n", out.items);
 
     out.clearRetainingCapacity();
     writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, writer, null);
+    _ = try executeResp(cache_instance, .{ .decr = .{ .key = "counter" } }, null, writer, null, null);
     try std.testing.expectEqualStrings(":10\r\n", out.items);
 
     const entry_handle = (try cache_mod.engine.load(cache_instance, "counter", .{})) orelse {
@@ -936,8 +1017,36 @@ test "resp execution info returns snapshot" {
     };
 
     const writer = out.writer(allocator);
-    _ = try executeResp(cache_instance, .{ .info = {} }, null, writer, snapshot);
+    _ = try executeResp(cache_instance, .{ .info = {} }, null, writer, null, snapshot);
     const data = out.items;
     try std.testing.expect(std.mem.indexOf(u8, data, "server.total_connections:4") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "cache.items:1") != null);
+}
+
+test "resp execution reports aof failures" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const cache_instance = try cache_mod.engine.init(.{ .allocator = allocator, .nshards = 4 });
+    defer cache_mod.engine.deinit(cache_instance);
+
+    var mgr = aof.Manager.init(allocator, cache_instance, .{
+        .path = "dummy.aof",
+        .enabled = true,
+    });
+    mgr.failed.store(true, .release);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    const res = try executeResp(
+        cache_instance,
+        .{ .set = .{ .key = "k", .value = "v", .options = .{} } },
+        null,
+        writer,
+        &mgr,
+        null,
+    );
+    try std.testing.expect(res.cache_error);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "ERR persistence failed") != null);
 }

@@ -257,22 +257,23 @@ RESP 命令：
 - `PING` 回复 `+PONG`
 - `INFO` 和 `STATS` 返回 `key:value` 行的批量字符串
 - `GET <key>` 返回批量字符串或 `$-1`
-- `SET <key> <value> [NX|XX] [EX seconds|PX ms]` 设置值
+- `SET <key> <value> [NX|XX] [EX seconds]` 设置值
 - `DEL <key>` 返回 `:1`（已删除）或 `:0`（未删除）
 - `INCR <key>` 和 `DECR <key>` 更新整数计数器
 - `EXPIRE <key> <seconds>` 设置 TTL，返回 `:1` 或 `:0`
 - `TTL <key>` 返回剩余秒数，`-1` 表示无 TTL，`-2` 表示不存在
 - `SAVE [TO <path>] [FAST]` 写入快照
 - `LOAD [FROM <path>] [FAST]` 加载快照
+- `BGREWRITEAOF` 触发后台 AOF 重写
   支持 RESP 流水线；命令按顺序处理
 
 ### 持久化
 
-- `--persist <path>` 启用启动时加载快照并在 SIGINT/SIGTERM 时保存
-- `SAVE`/`LOAD` 使用配置的路径，除非提供了覆盖
-- `FAST` 启用并行保存/加载 workers
+- 使用 `--dir` 与 `--dbfilename` 配置快照路径；`--appendonly` 启用 AOF，`--appendfilename` 配置 AOF 文件名
+- 启用 AOF 且文件存在时，启动优先回放 AOF，否则回落加载快照
+- `SAVE`/`LOAD` 使用配置路径（可覆写），且不会改写 AOF；`FAST` 启用并行保存/加载 workers
 - `SAVE`/`LOAD` 异步运行；如果保存/加载已在进行中，服务器返回 HTTP 409 或 RESP `-ERR`，请稍后重试
-- 快照使用 LZ4 压缩的块和 CRC32；TTL 存储为剩余时间，并在加载时根据挂钟重新计算，仅当启用 CAS 且快照记录了 CAS 时才恢复 CAS
+- 快照与 AOF 记录绝对过期时间；加载时按挂钟跳过已过期记录；CAS 仅在启用且快照记录时才恢复
 
 ## 路线图
 
@@ -283,5 +284,5 @@ RESP 命令：
 - [X] 带 `SAVE`/`LOAD` 的快照持久化（包括 `FAST` 模式）
 - [ ] 协议兼容性：扩展 RESP 命令覆盖范围以实现更广泛的客户端互操作性
 - [ ] 服务端 batch 语义：跨多条命令持有 shard 锁
-- [ ] 持久化和恢复：定期快照和增量/基于 WAL 的恢复
+- [X] 混合持久化：快照 + AOF + 后台重写
 - [ ] 安全性：TLS 和身份验证令牌支持

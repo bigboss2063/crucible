@@ -260,22 +260,23 @@ RESP commands:
 - `PING` replies with `+PONG`.
 - `INFO` and `STATS` return a bulk string of `key:value` lines.
 - `GET <key>` returns a bulk string or `$-1`.
-- `SET <key> <value> [NX|XX] [EX seconds|PX ms]` sets a value.
+- `SET <key> <value> [NX|XX] [EX seconds]` sets a value.
 - `DEL <key>` returns `:1` if deleted, `:0` otherwise.
 - `INCR <key>` and `DECR <key>` update integer counters.
 - `EXPIRE <key> <seconds>` sets TTL and returns `:1` or `:0`.
 - `TTL <key>` returns seconds remaining, `-1` for no TTL, `-2` if missing.
 - `SAVE [TO <path>] [FAST]` writes a snapshot.
 - `LOAD [FROM <path>] [FAST]` loads a snapshot.
+- `BGREWRITEAOF` triggers a background AOF rewrite.
   RESP pipeline is supported; commands are processed in order.
 
 ### Persistence
 
-- `--persist <path>` enables snapshot load at startup and save on SIGINT/SIGTERM.
-- `SAVE`/`LOAD` use the configured path unless an override is provided.
-- `FAST` enables parallel save/load workers.
-- `SAVE`/`LOAD` run asynchronously; if a save/load is already in progress the server returns HTTP 409 or RESP `-ERR`, so retry after a short delay.
-- Snapshots use LZ4-compressed blocks with CRC32; TTLs are stored as remaining time and recomputed against wall clock on load, and CAS is restored only when CAS is enabled and the snapshot recorded CAS.
+- Use `--dir` and `--dbfilename` to configure the snapshot path; `--appendonly` enables AOF and `--appendfilename` sets the AOF filename.
+- When AOF is enabled and the file exists, startup replays the AOF; otherwise it falls back to loading the snapshot.
+- `SAVE`/`LOAD` use the configured path (with optional overrides) and do not rewrite the AOF; `FAST` enables parallel save/load workers.
+- `SAVE`/`LOAD` run asynchronously; repeated requests return HTTP 409 or RESP `-ERR`, so retry after a short delay.
+- Snapshots and AOF records store absolute expiration times; expired entries are skipped on load; CAS is restored only when enabled and recorded.
 
 ## Roadmap
 
@@ -286,5 +287,5 @@ RESP commands:
 * [X]  Snapshot persistence with `SAVE`/`LOAD` (including `FAST` mode).
 * [ ]  Protocol compatibility: expand RESP command coverage for broader client interoperability.
 * [ ]  Server-side batch semantics: hold shard locks across multi-command batches.
-* [ ]  Persistence and recovery: periodic snapshots and incremental/WAL-based recovery.
+* [X]  Hybrid persistence: snapshots + AOF + background rewrite.
 * [ ]  Security: TLS and auth token support.

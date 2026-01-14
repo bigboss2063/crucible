@@ -6,6 +6,7 @@ const connection = @import("connection.zig");
 const execute = @import("execute.zig");
 const output_buffer = @import("output_buffer.zig");
 const persistence = @import("persistence.zig");
+const aof = @import("aof.zig");
 const resource_controls = @import("resource_controls.zig");
 const stats = @import("stats.zig");
 const http = @import("protocol/http.zig");
@@ -23,10 +24,19 @@ pub const Limits = comptime_parser.Limits;
 const default_read_buffer_bytes: usize = 16 * 1024;
 const default_request_bytes: usize = 1024 * 1024;
 
+pub const PersistenceOptions = struct {
+    snapshot_path: ?[]const u8 = null,
+    appendonly: bool = false,
+    aof_path: ?[]const u8 = null,
+    appendfsync: aof.AppendFsync = .everysec,
+    auto_aof_rewrite_percentage: u32 = 100,
+    auto_aof_rewrite_min_size: u64 = 64 * 1024 * 1024,
+};
+
 pub const ServerOptions = struct {
     allocator: std.mem.Allocator,
     cache: *cache.api.Cache,
-    persist_path: ?[]const u8 = null,
+    persistence: PersistenceOptions = .{},
     unix_path: ?[]const u8 = null,
     address: std.net.Address,
     protocol: Protocol = .auto,
@@ -690,6 +700,7 @@ const ServerContext = struct {
     active_connections: *AtomicUsize,
     cache: *cache.api.Cache,
     persistence: *persistence.Manager,
+    aof: *aof.Manager,
     persist_queue: *PersistQueue,
     persist_async: *xev.Async,
     resource_controls: ?*resource_controls.ResourceControls,
@@ -727,6 +738,7 @@ pub const Server = struct {
     monitor_registry: MonitorRegistry,
     start_time_ms: u64,
     persistence: *persistence.Manager,
+    aof: *aof.Manager,
     context: ServerContext,
     bound_address: std.net.Address,
     resource_controls: resource_controls.ResourceControls,
@@ -750,8 +762,21 @@ pub const Server = struct {
         errdefer opts.allocator.destroy(metrics);
         const start_time_ms = @as(u64, @intCast(std.time.milliTimestamp()));
         const persistence_mgr = try opts.allocator.create(persistence.Manager);
-        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persist_path);
+        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persistence.snapshot_path);
         errdefer opts.allocator.destroy(persistence_mgr);
+        const aof_mgr = try opts.allocator.create(aof.Manager);
+        aof_mgr.* = aof.Manager.init(opts.allocator, opts.cache, .{
+            .path = opts.persistence.aof_path,
+            .enabled = opts.persistence.appendonly,
+            .append_fsync = opts.persistence.appendfsync,
+            .auto_rewrite_percentage = opts.persistence.auto_aof_rewrite_percentage,
+            .auto_rewrite_min_size = opts.persistence.auto_aof_rewrite_min_size,
+        });
+        errdefer {
+            aof_mgr.deinit();
+            opts.allocator.destroy(aof_mgr);
+        }
+        try aof_mgr.start();
         var loop = try xev.Loop.init(.{
             .entries = opts.loop_entries,
             .thread_pool = opts.thread_pool,
@@ -812,6 +837,7 @@ pub const Server = struct {
             .monitor_registry = .{},
             .start_time_ms = start_time_ms,
             .persistence = persistence_mgr,
+            .aof = aof_mgr,
             .context = undefined,
             .bound_address = bound_address,
             .shutdown_async = shutdown_async,
@@ -829,6 +855,7 @@ pub const Server = struct {
         }
         self.persistence.waitForIdle();
         self.persistence.drainPendingPath();
+        self.aof.deinit();
         self.pool.deinit();
         self.monitor_registry.deinit(self.allocator);
         self.shutdown_async.deinit();
@@ -836,6 +863,7 @@ pub const Server = struct {
         self.persist_queue.deinit();
         self.loop.deinit();
         self.allocator.destroy(self.persistence);
+        self.allocator.destroy(self.aof);
         if (self.owns_metrics) {
             self.allocator.destroy(self.metrics);
         }
@@ -854,6 +882,7 @@ pub const Server = struct {
             .active_connections = &self.metrics.active_connections,
             .cache = self.cache,
             .persistence = self.persistence,
+            .aof = self.aof,
             .persist_queue = &self.persist_queue,
             .persist_async = &self.persist_async,
             .resource_controls = &self.resource_controls,
@@ -1177,6 +1206,7 @@ fn handleHttpCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: htt
         ctx.resource_controls,
         conn.keepalive,
         writer,
+        ctx.aof,
         snapshot,
     ) catch {
         handleOutputOverflow(conn, ctx);
@@ -1241,6 +1271,10 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
             _ = handlePersistCommand(conn, ctx, false, load_cmd.path, load_cmd.fast);
             return;
         },
+        .bgrewriteaof => {
+            _ = handleAofRewriteCommand(conn, ctx);
+            return;
+        },
         else => {},
     }
 
@@ -1258,6 +1292,7 @@ fn handleRespCommand(conn: *connection.Connection, ctx: *ServerContext, cmd: res
         cmd,
         ctx.resource_controls,
         writer,
+        ctx.aof,
         snapshot,
     ) catch {
         handleOutputOverflow(conn, ctx);
@@ -1333,6 +1368,50 @@ fn handlePersistCommand(
             conn.persist_close_after = false;
             allocator.destroy(notify);
             if (!writePersistFailure(conn, ctx, "ERR persistence failed", 500, "Internal Server Error")) {
+                handleOutputOverflow(conn, ctx);
+            }
+        },
+    }
+    return false;
+}
+
+fn aofRewriteCompletion(_: *anyopaque, _: bool) void {
+    // TODO: add optional metrics/logging for rewrite completion.
+}
+
+fn handleAofRewriteCommand(conn: *connection.Connection, ctx: *ServerContext) bool {
+    const status = ctx.aof.startRewrite(ctx, aofRewriteCompletion);
+    switch (status) {
+        .ok => {
+            const writer = &conn.write_buf;
+            const wrote = switch (conn.protocol) {
+                .http => writeHttpResponseWithBody(writer, 200, "OK", "OK", conn.keepalive),
+                .resp => writeRespSimple(writer, "OK"),
+                .unknown => false,
+            };
+            if (!wrote) {
+                handleOutputOverflow(conn, ctx);
+                return false;
+            }
+            recordResponse(conn);
+            if (conn.protocol == .http and !conn.keepalive) {
+                conn.closing = true;
+            }
+            queueWrite(conn, ctx);
+            return true;
+        },
+        .disabled => {
+            if (!writePersistFailure(conn, ctx, "ERR aof disabled", 400, "Bad Request")) {
+                handleOutputOverflow(conn, ctx);
+            }
+        },
+        .busy => {
+            if (!writePersistFailure(conn, ctx, "ERR rewrite already in progress", 409, "Conflict")) {
+                handleOutputOverflow(conn, ctx);
+            }
+        },
+        .failed => {
+            if (!writePersistFailure(conn, ctx, "ERR aof rewrite failed", 500, "Internal Server Error")) {
                 handleOutputOverflow(conn, ctx);
             }
         },
@@ -1805,6 +1884,7 @@ const Worker = struct {
         queue_capacity: usize,
         limits: Limits,
         persistence_ptr: *persistence.Manager,
+        aof_ptr: *aof.Manager,
         metrics_snapshot: MetricsSnapshotFn,
         metrics_snapshot_ctx: *const anyopaque,
         start_time_ms: u64,
@@ -1868,6 +1948,7 @@ const Worker = struct {
             .active_connections = active_connections,
             .cache = cache_ptr,
             .persistence = persistence_ptr,
+            .aof = aof_ptr,
             .persist_queue = &self.persist_queue,
             .persist_async = &self.async,
             .resource_controls = null,
@@ -1971,6 +2052,7 @@ pub const ThreadedServer = struct {
     metrics: *AtomicMetrics,
     start_time_ms: u64,
     persistence: *persistence.Manager,
+    aof: *aof.Manager,
     loop: xev.Loop,
     listener: xev.TCP,
     accept_completion: xev.Completion = .{},
@@ -2005,8 +2087,21 @@ pub const ThreadedServer = struct {
         errdefer opts.allocator.destroy(metrics);
         const start_time_ms = @as(u64, @intCast(std.time.milliTimestamp()));
         const persistence_mgr = try opts.allocator.create(persistence.Manager);
-        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persist_path);
+        persistence_mgr.* = persistence.Manager.init(opts.allocator, opts.cache, opts.persistence.snapshot_path);
         errdefer opts.allocator.destroy(persistence_mgr);
+        const aof_mgr = try opts.allocator.create(aof.Manager);
+        aof_mgr.* = aof.Manager.init(opts.allocator, opts.cache, .{
+            .path = opts.persistence.aof_path,
+            .enabled = opts.persistence.appendonly,
+            .append_fsync = opts.persistence.appendfsync,
+            .auto_rewrite_percentage = opts.persistence.auto_aof_rewrite_percentage,
+            .auto_rewrite_min_size = opts.persistence.auto_aof_rewrite_min_size,
+        });
+        errdefer {
+            aof_mgr.deinit();
+            opts.allocator.destroy(aof_mgr);
+        }
+        try aof_mgr.start();
 
         var loop = try xev.Loop.init(.{
             .entries = opts.loop_entries,
@@ -2078,6 +2173,7 @@ pub const ThreadedServer = struct {
                 queue_cap,
                 limits,
                 persistence_mgr,
+                aof_mgr,
                 snapshotThreaded,
                 metrics_context,
                 start_time_ms,
@@ -2121,6 +2217,7 @@ pub const ThreadedServer = struct {
             .metrics = metrics,
             .start_time_ms = start_time_ms,
             .persistence = persistence_mgr,
+            .aof = aof_mgr,
             .loop = loop,
             .listener = listener,
             .unix_listener = unix_listener,
@@ -2138,6 +2235,7 @@ pub const ThreadedServer = struct {
         self.stop();
         self.persistence.waitForIdle();
         self.persistence.drainPendingPath();
+        self.aof.deinit();
         var i: usize = 0;
         while (i < self.workers.len) : (i += 1) {
             self.workers[i].join();
@@ -2155,6 +2253,7 @@ pub const ThreadedServer = struct {
         self.shutdown_async.deinit();
         self.loop.deinit();
         self.allocator.destroy(self.persistence);
+        self.allocator.destroy(self.aof);
         self.allocator.destroy(self.metrics);
     }
 
@@ -2398,6 +2497,53 @@ fn waitForMetricsSnapshot(server: anytype, min_requests: u64, min_responses: u64
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     return server.metricsSnapshot();
+}
+
+fn writeRespCommand(stream: *std.net.Stream, args: []const []const u8) !void {
+    var header_buf: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "*{d}\r\n", .{args.len});
+    try stream.writeAll(header);
+    for (args) |arg| {
+        const line = try std.fmt.bufPrint(&header_buf, "${d}\r\n", .{arg.len});
+        try stream.writeAll(line);
+        try stream.writeAll(arg);
+        try stream.writeAll("\r\n");
+    }
+}
+
+fn readRespLine(reader: *std.net.Stream.Reader) ![]const u8 {
+    var line = try reader.interface().takeDelimiterInclusive('\n');
+    if (line.len > 0 and line[line.len - 1] == '\n') {
+        line = line[0 .. line.len - 1];
+    }
+    if (line.len > 0 and line[line.len - 1] == '\r') {
+        line = line[0 .. line.len - 1];
+    }
+    return line;
+}
+
+fn expectRespOk(reader: *std.net.Stream.Reader) !void {
+    const line = try readRespLine(reader);
+    try std.testing.expect(line.len >= 3);
+    try std.testing.expect(line[0] == '+');
+    try std.testing.expectEqualStrings("OK", line[1..]);
+}
+
+fn expectCacheValue(cache_instance: *cache.api.Cache, key: []const u8, expected: ?[]const u8) !void {
+    const entry = try cache.engine.load(cache_instance, key, .{});
+    if (expected) |value| {
+        const handle = entry orelse {
+            try std.testing.expect(false);
+            return;
+        };
+        defer handle.release();
+        try std.testing.expectEqualStrings(value, handle.value());
+    } else {
+        if (entry) |handle| {
+            defer handle.release();
+        }
+        try std.testing.expect(entry == null);
+    }
 }
 
 test "server accepts HTTP connections" {
@@ -2674,6 +2820,132 @@ test "resp end-to-end and pipeline" {
         seen = std.mem.count(u8, resp_buf.items, resp_header);
     }
     try std.testing.expectEqual(pipeline, seen);
+}
+
+test "restart loads snapshot data" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "dump.rdb",
+    });
+    defer allocator.free(snapshot_path);
+
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .persistence = .{
+            .snapshot_path = snapshot_path,
+            .appendonly = false,
+        },
+    });
+    var stopped = false;
+    defer if (!stopped) harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    var reader_buf: [256]u8 = undefined;
+    var reader = stream.reader(reader_buf[0..]);
+
+    try writeRespCommand(&stream, &[_][]const u8{ "SET", "snap_key", "snap_val" });
+    try expectRespOk(&reader);
+    try writeRespCommand(&stream, &[_][]const u8{ "SAVE" });
+    try expectRespOk(&reader);
+
+    harness.stop();
+    stopped = true;
+
+    const cache_loaded = try cache.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache.engine.deinit(cache_loaded);
+
+    _ = try persistence.loadSnapshot(allocator, cache_loaded, .{ .path = snapshot_path });
+    try expectCacheValue(cache_loaded, "snap_key", "snap_val");
+}
+
+test "restart replays aof and expires offline ttl" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "dump.rdb",
+    });
+    defer allocator.free(snapshot_path);
+
+    const aof_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "appendonly.aof",
+    });
+    defer allocator.free(aof_path);
+
+    const cache_instance = try cache.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache.engine.deinit(cache_instance);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var harness = try TestServer.start(.{
+        .allocator = allocator,
+        .cache = cache_instance,
+        .address = addr,
+        .protocol = .resp,
+        .persistence = .{
+            .snapshot_path = snapshot_path,
+            .appendonly = true,
+            .aof_path = aof_path,
+            .appendfsync = .always,
+            .auto_aof_rewrite_min_size = 0,
+        },
+    });
+    var stopped = false;
+    defer if (!stopped) harness.stop();
+
+    var stream = try connectRetry(harness.server.address());
+    defer stream.close();
+
+    var reader_buf: [256]u8 = undefined;
+    var reader = stream.reader(reader_buf[0..]);
+
+    try writeRespCommand(&stream, &[_][]const u8{ "SET", "aof_key", "snap" });
+    try expectRespOk(&reader);
+    try writeRespCommand(&stream, &[_][]const u8{ "SAVE" });
+    try expectRespOk(&reader);
+    try writeRespCommand(&stream, &[_][]const u8{ "SET", "aof_key", "aof" });
+    try expectRespOk(&reader);
+    try writeRespCommand(&stream, &[_][]const u8{ "SET", "aof_ttl", "v", "EX", "1" });
+    try expectRespOk(&reader);
+
+    harness.stop();
+    stopped = true;
+
+    std.Thread.sleep(1500 * std.time.ns_per_ms);
+
+    const cache_loaded = try cache.engine.init(.{ .allocator = allocator, .nshards = 1 });
+    defer cache.engine.deinit(cache_loaded);
+
+    _ = try aof.replay(allocator, cache_loaded, aof_path);
+    try expectCacheValue(cache_loaded, "aof_key", "aof");
+    try expectCacheValue(cache_loaded, "aof_ttl", null);
 }
 
 test "resp large response grows buffers" {
