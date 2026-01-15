@@ -65,6 +65,70 @@ fn loadUpdate(
     };
 }
 
+const CounterUpdateCtx = struct {
+    delta: i64,
+    updated: *?i64,
+    buf: *[32]u8,
+};
+
+fn counterUpdate(
+    shard: u32,
+    time: i64,
+    key: []const u8,
+    value: []const u8,
+    expires: i64,
+    flags: u32,
+    cas: u64,
+    udata: ?*anyopaque,
+) ?crucible.Update {
+    _ = shard;
+    _ = time;
+    _ = key;
+    _ = cas;
+
+    const ctx = @as(*CounterUpdateCtx, @ptrCast(@alignCast(udata.?)));
+    const current = std.fmt.parseInt(i64, value, 10) catch return null;
+    const next = current + ctx.delta;
+    const slice = std.fmt.bufPrint(ctx.buf, "{d}", .{next}) catch return null;
+    ctx.updated.* = next;
+    return .{
+        .value = slice,
+        .flags = flags,
+        .expires = expires,
+    };
+}
+
+const ExpireUpdateCtx = struct {
+    updated: *bool,
+    now_time: i64,
+    ttl: i64,
+};
+
+fn expireUpdate(
+    shard: u32,
+    time: i64,
+    key: []const u8,
+    value: []const u8,
+    expires: i64,
+    flags: u32,
+    cas: u64,
+    udata: ?*anyopaque,
+) ?crucible.Update {
+    _ = shard;
+    _ = time;
+    _ = key;
+    _ = expires;
+    _ = cas;
+
+    const ctx = @as(*ExpireUpdateCtx, @ptrCast(@alignCast(udata.?)));
+    ctx.updated.* = true;
+    return .{
+        .value = value,
+        .flags = flags,
+        .expires = ctx.now_time + ctx.ttl,
+    };
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -105,6 +169,67 @@ pub fn main() !void {
             "load update alpha value={s} flags={d}\n",
             .{ entry_handle.value(), entry_handle.flags() },
         );
+    }
+
+    _ = try crucible.store(cache, "counter", "10", .{});
+
+    var counter_buf: [32]u8 = undefined;
+    var counter_updated: ?i64 = null;
+    var counter_ctx = CounterUpdateCtx{
+        .delta = 1,
+        .updated = &counter_updated,
+        .buf = &counter_buf,
+    };
+    const incr_entry = try crucible.load(cache, "counter", .{ .update = counterUpdate, .udata = &counter_ctx });
+    if (incr_entry) |entry_handle| {
+        entry_handle.release();
+        if (counter_updated) |next| {
+            std.debug.print("incr counter -> {d}\n", .{next});
+        } else {
+            std.debug.print("incr counter -> not an integer\n", .{});
+        }
+    } else {
+        std.debug.print("incr counter -> not found\n", .{});
+    }
+
+    counter_updated = null;
+    counter_ctx.delta = -2;
+    const decr_entry = try crucible.load(cache, "counter", .{ .update = counterUpdate, .udata = &counter_ctx });
+    if (decr_entry) |entry_handle| {
+        entry_handle.release();
+        if (counter_updated) |next| {
+            std.debug.print("decr counter -> {d}\n", .{next});
+        } else {
+            std.debug.print("decr counter -> not an integer\n", .{});
+        }
+    } else {
+        std.debug.print("decr counter -> not found\n", .{});
+    }
+
+    _ = try crucible.store(cache, "session", "alive", .{});
+    const expire_now = crucible.now();
+    const ttl_ns = @as(i64, @intCast(2 * std.time.ns_per_s));
+    var expire_updated = false;
+    var expire_ctx = ExpireUpdateCtx{
+        .updated = &expire_updated,
+        .now_time = expire_now,
+        .ttl = ttl_ns,
+    };
+    const expire_entry = try crucible.load(
+        cache,
+        "session",
+        .{ .time = expire_now, .update = expireUpdate, .udata = &expire_ctx },
+    );
+    if (expire_entry) |entry_handle| {
+        entry_handle.release();
+    }
+    std.debug.print("expire session updated={s}\n", .{if (expire_updated) "true" else "false"});
+    const expired_entry = try crucible.load(cache, "session", .{ .time = expire_now + ttl_ns + 1 });
+    if (expired_entry) |entry_handle| {
+        entry_handle.release();
+        std.debug.print("load session after ttl status=Found\n", .{});
+    } else {
+        std.debug.print("load session after ttl status=NotFound\n", .{});
     }
 
     const temp_opts = crucible.StoreOptions{
